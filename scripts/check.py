@@ -64,13 +64,6 @@ _RESTRICTED_CHAR: dict[int, frozenset[str]] = {
             "8e131105bb6c2f67ce2e640cc9cbc8f11a3061a1db66d41036b8882590429e4e",
         }
     ),
-    4: frozenset(
-        {
-            "771d26797da43f05ce800e02d8ae9f1d62535553ec8f23cb8fb0e9ff929d34b2",
-            "95beb193a957daea8324eccd0d5b15ccb2ea21e9065083710d4e5d9e5a126b27",
-            "f2a722d81a2fd8ca7529c11dbee909e48441ad1ec52347ca9867f00d2d58469c",
-        }
-    ),
     2: frozenset(
         {
             "a9ab292ea9feecdcdfd3d6dfae632d35e27923892feb884ddb36502a9e89a67d",
@@ -130,6 +123,38 @@ _RESTRICTED_TOKEN: dict[int, frozenset[str]] = {
     ),
 }
 _RESTRICTED_TOKEN_WINDOW = 4
+
+_CONTEXT_CHAR: dict[int, frozenset[str]] = {
+    4: frozenset(
+        {
+            "f2a722d81a2fd8ca7529c11dbee909e48441ad1ec52347ca9867f00d2d58469c",
+            "771d26797da43f05ce800e02d8ae9f1d62535553ec8f23cb8fb0e9ff929d34b2",
+            "95beb193a957daea8324eccd0d5b15ccb2ea21e9065083710d4e5d9e5a126b27",
+        }
+    ),
+}
+_CONTEXT_TOKEN: dict[int, frozenset[str]] = {
+    14: frozenset(
+        {
+            "aa3646e600de6d24442780e71d478e1a507d96772efb0a072827f8d1ffc9ea11",
+        }
+    ),
+}
+_CONTEXT_CHAR_WORDS = ("仓库", "项目", "题库", "repo")
+_CONTEXT_TOKEN_WORDS = frozenset(
+    {
+        "repo",
+        "repos",
+        "repository",
+        "repositories",
+        "project",
+        "projects",
+        "fork",
+        "forks",
+    }
+)
+_CONTEXT_CHAR_SPAN = 12
+_CONTEXT_TOKEN_SPAN = 6
 
 LICENSE_PATH = ROOT / "LICENSE"
 REQUIRED_HOLDER = "cluster1900"
@@ -478,55 +503,142 @@ def _read_repo_text(path: Path) -> str | None:
     return data.decode("utf-8", errors="replace")
 
 
+def _ascii_digit_token(s: str) -> bool:
+    return bool(s) and s.isascii() and s.isdigit()
+
+
+def _version_prefix_suppressed(
+    tokens: list[str], token_line: list[int], i: int, width: int
+) -> bool:
+    window = tokens[i : i + width]
+    if not _ascii_digit_token(window[-1]):
+        return False
+    if sum(1 for t in window if _ascii_digit_token(t)) != 1:
+        return False
+    nxt = i + width
+    if nxt >= len(tokens):
+        return False
+    if token_line[nxt] != token_line[i + width - 1]:
+        return False
+    return _ascii_digit_token(tokens[nxt])
+
+
+def _merge_len1_runs(
+    tokens: list[str], token_line: list[int]
+) -> tuple[list[str], list[int], list[tuple[str, int]]]:
+    merged: list[str] = []
+    lines: list[int] = []
+    runs: list[tuple[str, int]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        if len(tokens[i]) == 1:
+            j = i + 1
+            while j < n and len(tokens[j]) == 1:
+                j += 1
+            if j - i >= 2:
+                run = "".join(tokens[i:j])
+                lineno = token_line[i]
+                merged.append(run)
+                lines.append(lineno)
+                runs.append((run, lineno))
+                i = j
+                continue
+        merged.append(tokens[i])
+        lines.append(token_line[i])
+        i += 1
+    return merged, lines, runs
+
+
+def _scan_token_windows(
+    tokens: list[str], token_line: list[int], hits: set[int]
+) -> None:
+    ntok = len(tokens)
+    for width in range(1, _RESTRICTED_TOKEN_WINDOW + 1):
+        if ntok < width:
+            break
+        for i in range(ntok - width + 1):
+            if _version_prefix_suppressed(tokens, token_line, i, width):
+                continue
+            joined = "".join(tokens[i : i + width])
+            L = len(joined)
+            h = _digest(joined)
+            want = _RESTRICTED_TOKEN.get(L)
+            if want and h in want:
+                hits.add(token_line[i])
+            cwant = _CONTEXT_TOKEN.get(L)
+            if cwant and h in cwant:
+                lo = max(0, i - _CONTEXT_TOKEN_SPAN)
+                hi = i + width + _CONTEXT_TOKEN_SPAN
+                if any(t in _CONTEXT_TOKEN_WORDS for t in tokens[lo:hi]):
+                    hits.add(token_line[i])
+
+
+def scan_restricted_text(text: str) -> set[int]:
+    hits: set[int] = set()
+    char_buf: list[str] = []
+    char_line: list[int] = []
+    tokens: list[str] = []
+    token_line: list[int] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        folded = unicodedata.normalize("NFKC", line).casefold()
+        for ch in folded:
+            if ch.isalnum():
+                char_buf.append(ch)
+                char_line.append(lineno)
+        for tok in re.findall(r"[^\W_]+", folded):
+            tokens.append(tok)
+            token_line.append(lineno)
+
+    norm = "".join(char_buf)
+    n = len(norm)
+    ctx_needles = tuple(
+        "".join(
+            ch
+            for ch in unicodedata.normalize("NFKC", w).casefold()
+            if ch.isalnum()
+        )
+        for w in _CONTEXT_CHAR_WORDS
+    )
+    for L in set(_RESTRICTED_CHAR) | set(_CONTEXT_CHAR):
+        if n < L:
+            continue
+        want = _RESTRICTED_CHAR.get(L)
+        cwant = _CONTEXT_CHAR.get(L)
+        for i in range(n - L + 1):
+            h = _digest(norm[i : i + L])
+            if want and h in want:
+                hits.add(char_line[i])
+            elif cwant and h in cwant:
+                lo = max(0, i - _CONTEXT_CHAR_SPAN)
+                hi = i + L + _CONTEXT_CHAR_SPAN
+                window = norm[lo:hi]
+                if any(needle in window for needle in ctx_needles):
+                    hits.add(char_line[i])
+
+    _scan_token_windows(tokens, token_line, hits)
+    merged, merged_line, runs = _merge_len1_runs(tokens, token_line)
+    _scan_token_windows(merged, merged_line, hits)
+    for run, lineno in runs:
+        nrun = len(run)
+        for L, want in _RESTRICTED_TOKEN.items():
+            if nrun < L:
+                continue
+            for k in range(nrun - L + 1):
+                if _digest(run[k : k + L]) in want:
+                    hits.add(lineno)
+                    break
+    return hits
+
+
 def check_restricted_terms() -> None:
     hits: set[tuple[str, int]] = set()
-    char_lengths = sorted(_RESTRICTED_CHAR)
-    min_char_len = char_lengths[0] if char_lengths else 0
-    token_lengths = _RESTRICTED_TOKEN
-    max_token_window = _RESTRICTED_TOKEN_WINDOW
-
     for rel, path in _iter_repo_files():
         text = _read_repo_text(path)
         if text is None:
             continue
-
-        char_buf: list[str] = []
-        char_line: list[int] = []
-        tokens: list[str] = []
-        token_line: list[int] = []
-        for lineno, line in enumerate(text.splitlines(), 1):
-            folded = unicodedata.normalize("NFKC", line).casefold()
-            for ch in folded:
-                if ch.isalnum():
-                    char_buf.append(ch)
-                    char_line.append(lineno)
-            for tok in re.findall(r"[^\W_]+", folded):
-                tokens.append(tok)
-                token_line.append(lineno)
-
-        norm = "".join(char_buf)
-        n = len(norm)
-        if n >= min_char_len:
-            for L in char_lengths:
-                if n < L:
-                    continue
-                want = _RESTRICTED_CHAR[L]
-                limit = n - L + 1
-                for i in range(limit):
-                    if _digest(norm[i : i + L]) in want:
-                        hits.add((rel, char_line[i]))
-
-        ntok = len(tokens)
-        if ntok:
-            for width in range(1, max_token_window + 1):
-                if ntok < width:
-                    break
-                for i in range(ntok - width + 1):
-                    joined = "".join(tokens[i : i + width])
-                    L = len(joined)
-                    want = token_lengths.get(L)
-                    if want and _digest(joined) in want:
-                        hits.add((rel, token_line[i]))
+        for lineno in scan_restricted_text(text):
+            hits.add((rel, lineno))
 
     ordered = sorted(hits)
     for rel, lineno in ordered:
