@@ -231,20 +231,43 @@ def typical_filter(logits, temperature=0.8, mass=0.9, tau=None):
 
 **Reasoning:** The goal is an entropy-aligned typicality filter, with structured output expected to break first. Each step must carry `H` and `|I−H|`, and both peaks and long tails can be cut by the same ruler. So log the statistic per step, and use different gold (JSON / chitchat / code) to see who cracks first, not average fluency.
 
-## CODE-008. Full-prompt forward and "prefill then step-by-step decode" disagree on the same prefix logits — do you inspect the concat dimension, the absolute-position mask, or a Q that was cached by mistake?
+## CODE-008. You must hand-write top-p (nucleus) in the decode loop: one step of logits, `p=0.9`, temperature T. After sorting, does the token that crosses the mass threshold stay in the nucleus? How do you handle T=0, two tokens tied, and logits that differ by hundreds before softmax, and what does each unit test assert?
 
-**Answer:** Cache only K and V: historical Q is unused later, and each step uses only the new token's Q. Check that concatenation is along the sequence axis (often dim=2 of `(B, H, S, Dh)`) and that the mask is drawn from the absolute index `S-T+i`. On step-by-step decode `T=1`, the new token may see every cached key, so the mask should be all-open; reusing the training `T×T` upper triangle mis-cuts or raises a shape error. When numbers disagree, compare “full recompute with cache off” versus “cache on” token by token before touching temperature or learning rate.
+**Answer:** Do a numerically stable softmax at temperature T, sort probability descending (break ties by token id ascending), take the shortest prefix whose cumulative mass is ≥ p — **including** the token that first pushes the sum across p — then renormalize on that nucleus and sample. For T≤0 skip the nucleus and argmax (lowest id on a tie). Subtract max(logits) before exp so the softmax cannot overflow to inf. p≤0 keeps only the top token; p≥1 keeps everyone. Tests use a tiny vocabulary and deterministic assertions, not “it looks diverse.”
 
-**Deep dive:** Prefill consumes `(B, S, D)` and writes that layer's full K, V. Decode consumes `(B, 1, D)`, produces this step's q, k, v, appends k, v to the cache, and dots `q_len=1` against `k_len=S+t`, so scores are `(B, H, 1, S+t)` rather than a square. `torch.cat` recopies the whole cache each step — an extra `O(S)` bandwidth term on long sequences; production preallocates to a max length or appends by page. Illustrative size: 32 layers, 32 heads, `Dh=128`, S=4096, B=8, fp16 is about `2×32×32×128×4096×8×2 ≈ 16GB`. Correctness contract: with greedy decoding or a fixed seed, incremental logits at each position should match the corresponding row of a single forward within dtype error. For RoPE, decide up front whether you cache rotated K or cache unrotated K and rotate by absolute position before the dot product — the two paths must not be mixed.
+**Deep dive:** A nucleus is the smallest high-probability set whose mass is at least p, so when `cumsum[k-1] < p ≤ cumsum[k]` index k must stay; an implementation that slices on `cumsum < p` will drop the only legal token on a peaky step. Temperature: `z = (logits - logits.max()) / T` — T changes sharpness, not rank. As T→0 the nucleus collapses to 1 and coincides with greedy; short-circuiting avoids a divide by zero. Ties: a stable key `(prob desc, id asc)` so numpy’s default quicksort cannot reshuffle a tied nucleus across runs. Numerics: without subtracting max, exp(100) already overflows float64; after subtracting max the top exp is 1 and nucleus mass adds. `searchsorted(cumsum, p, side="left") + 1` is “include the crossing point.” Five toy tokens cover the tests; you do not need a 100k vocabulary.
 
-**Follow-ups:** How cache and mask line up when sequences in one batch have different lengths; which copy makes repeated `cat` slower than preallocation; after a sliding window, which end you drop expired KV from.
+```python
+import numpy as np
+
+def nucleus_sample(logits, p=0.9, temperature=1.0, rng=None):
+    logits = np.asarray(logits, dtype=np.float64)
+    n = logits.size
+    if n == 0:
+        raise ValueError("empty logits")
+    if temperature <= 0 or p <= 0:
+        return int(np.flatnonzero(logits == logits.max())[0])
+    z = (logits - logits.max()) / temperature
+    prob = np.exp(z); prob /= prob.sum()
+    order = np.lexsort((np.arange(n), -prob))  # prob desc, id asc
+    csum = np.cumsum(prob[order])
+    cut = n if p >= 1 else int(np.searchsorted(csum, min(p, 1.0), side="left")) + 1
+    keep = order[:cut]
+    renormal = prob[keep]; renormal /= renormal.sum()
+    rng = np.random.default_rng(rng)
+    return int(rng.choice(keep, p=renormal))
+```
+
+Tests (T=0 and ties do not need rng): ① logits `[0, 10, 0]`, T=0 → index 1; ② `[5, 5, 0]`, T=0 → index 0 (lower id); ③ masses `[0.6, 0.25, 0.15]`, p=0.8 nucleus must be the first two (only 0.6+0.25=0.85 crosses), not 0.6 alone; ④ logits `[1000., 0., 0.]` must not yield inf/NaN, nucleus size 1.
+
+**Follow-ups:** p=0.9 but the top token is already 0.95 — is the nucleus size 1 or do you still pad one more; `lexsort` versus `argsort(-prob)` on a three-way tie, who is in the nucleus; if you stack a top-k cap after nucleus and k is smaller than the nucleus, which bound wins.
 
 **Extended questions:**
-- The user edits the system prompt mid-session: which layers' caches must be discarded wholesale?
-- In continuous batching a sequence finishes first — how do you return its KV pages without stepping on sequences still decoding?
-- After quantizing the cache to INT8, what alignment metric tells you the fp16 path is “equivalent enough”?
+- Draw the nucleus on a p_max=0.95 peak for “include the crossing token” versus “strict cumsum<p”, and say which one empties the nucleus.
+- With a fixed seed, assert that 100 draws from the same logits stay inside the nucleus and never hit the chopped tail.
+- At T=1, p=1 the function should equal multinomial on the softmax — which statistic stops a silent extra truncation?
 
-**Reasoning:** Mathematically, decode should equal taking only the last position of a full forward, so what you may cache is K and V, which do not change with future queries, and the mask must use absolute indices. Accept correctness with cache-on versus cache-off logit alignment; accept performance by dropping per-step attention from O(S²) to O(S).
+**Reasoning:** Implement nucleus with its boundaries, rather than restating “truncate by mass.” The crossing token must stay, T=0 and ties must be deterministic, and exp must be stable. Shortest prefix including the crossing token, argmax short-circuit, max-subtracted softmax. Accept when the four tiny-vocab assertions are green, not when the prose looks nice.
 
 ## CODE-009. The same Jinja setup renders the system segment and also inlines few-shot examples, and an example body happens to contain `{{nickname}}`. How do you distinguish placeholders that must be substituted from literal braces in the example, and unit-test that escaped examples do not break ChatML role headers?
 
@@ -363,20 +386,80 @@ Unit test: `tag_chunk("results", "Revenue (non-GAAP)") == "non_gaap"` and `cite_
 
 **Reasoning:** The goal is that numbers remain retrievable but cannot be restated under another accounting basis. Layout is already clean and the digits are unlabeled. So stamp a closed enum from heading/caption, and check (claimed basis × source tag). Accept when citing a non-GAAP number as official revenue goes red.
 
-## CODE-012. The internal wiki has about three thousand Markdown pages, and a retrieve-then-generate FAQ must ship Monday. How do you split ingest, retrieve, and prompt assembly into functions, and why must empty retrieval abort before the model is called?
+## CODE-012. The handbook is about 800 Markdown pages. You must hand-write a heading-hierarchy chunker: ATX `#`–`######` starts a chunk that carries a heading path such as `Auth > Timeouts`, but fenced code, GFM tables, and contiguous lists must not be split internally. Target chunk size is about 200–800 characters (illustrative). How does the line-scan state machine work, and which boundary cases do the unit tests pin?
 
-**Answer:** Ingest is `load → clean → chunk → embed → upsert`: read files, strip nav and footers, split on headings, embed in batches, and write rows with `doc_id / heading_path / char_span / version`. Query is `embed_query → retrieve(top_k, filter) → build_prompt → generate`, and only chunks that carry citation ids enter the context. If retrieval is empty, or the best score is below a threshold you calibrated, return “no support in the handbook” and do not hand an empty context to the model to “do its best”—parametric memory will invent policies that expired or were never written.
+**Answer:** Scan line by line with three pieces of state: the heading stack, whether you are inside a fence, and the current chunk buffer. Flush and update the path only on a new heading that is not inside a fence. Fences toggle on a line-leading run of three backticks or three tildes; `#`, `|`, and `- ` inside a fence are body text. A table is a run of `|` lines (plus the delimiter row); a list is a run of unordered/ordered items. On flush, those runs stay whole with this chunk or move whole to the next—never cut mid-row or mid-item. Each chunk object carries `heading_path`, start/end line, and the source slice.
 
-**Deep dive:** Each record needs at least `chunk_id, text, vector, source_path, heading_path, start, end, acl, doc_version`. Cleaning must drop sidebars and prev/next chrome, or nearest neighbors become site chrome. Chunks commonly target about 200–800 tokens with roughly 10%–20% overlap, keeping the heading path so a “Permissions” title is not severed from the parameter table under it. Query and document embeddings must use the same model and preprocessing; a model change is a new coordinate system and needs a full re-embed. Filter on ACL and version before taking top-k (for example 4–8 chunks); do not take a global top-k and drop afterward. In the prompt, chunks appear under stable ids such as `[c12]`; after generation, check that every citation is in this turn’s retrieval set and strip sentences that are not. The empty-retrieval gate sits before `build_prompt`: `k==0` or `max_score < τ` (calibrate τ on a labeled set for the embedding model you use—look at score quantiles rather than copying a universal decimal). A minimum viable build still needs that refusal, plus negative cases that point at deleted sections. Score retrieval recall and generation faithfulness separately; fluency alone is not the metric.
+**Deep dive:** The point is not “cut every N characters,” it is “cut only on a safe boundary.” Safe: start of a paragraph after a blank line, a heading line, outside a fence toggle. Unsafe: inside a fence, mid-table, mid-list. An oversized fence (illustrative: sample code longer than 800 characters) is kept intact and tagged `oversized=True` so retrieval can decide on a language-aware split later—the chunker must not insert a cut between the opening fence line and the closing fence line. The heading stack pops by level: a `##` drops any deeper `###`; join with ` > `; preface before the first heading has an empty path. Do not strip HTML comments or embed here—that is a cleaner’s job; this function only keeps structural units intact.
 
-**Follow-ups:** A Friday edit touches one section—do you upsert first or bulk-invalidate the old `doc_version` first; the top score barely clears τ but the chunk is off-topic—do you retune τ, add a keyword inverted index, or add a light reranker; when the model fabricates a citation id, do you strip, refuse the whole answer, or retrieve again.
+```python
+import re
+ATX = re.compile(r"^(#{1,6})\s+(.*)$")
+BT = chr(96) * 3
+FENCE = re.compile("^(" + re.escape(BT) + "|~~~)")
+TABLE = re.compile(r"^\s*\|")
+LIST = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+def chunk_markdown(src, max_chars=800):
+    lines = src.splitlines(keepends=True)
+    path, buf, start, fence, out = [], [], 0, None, []
+    def flush(end):
+        text = "".join(buf)
+        if text.strip():
+            out.append({"heading_path": tuple(path), "start": start, "end": end, "text": text})
+        buf.clear()
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if fence:
+            buf.append(ln)
+            if ln.startswith(fence):
+                fence = None
+            i += 1
+            continue
+        fm = FENCE.match(ln)
+        if fm:
+            if buf and sum(map(len, buf)) >= max_chars:
+                flush(i)
+                start = i
+            fence = fm.group(1)
+            buf.append(ln); i += 1
+            continue
+        hm = ATX.match(ln)
+        if hm:
+            flush(i)
+            level, title = len(hm.group(1)), hm.group(2).strip()
+            path[:] = path[: level - 1] + [title]
+            start = i; buf.append(ln); i += 1
+            continue
+        if TABLE.match(ln) or LIST.match(ln):
+            kind = TABLE if TABLE.match(ln) else LIST
+            j = i
+            while j < len(lines) and (kind.match(lines[j]) or (kind is TABLE and re.match(r"^\s*\|?\s*[-:| ]+\s*$", lines[j]))):
+                j += 1
+            block = lines[i:j]
+            if buf and sum(map(len, buf)) + sum(map(len, block)) > max_chars:
+                flush(i); start = i
+            buf.extend(block); i = j
+            continue
+        buf.append(ln)
+        if ln.strip() == "" and sum(map(len, buf)) >= max_chars:
+            flush(i + 1); start = i + 1
+        i += 1
+    flush(len(lines))
+    return out
+```
+
+Four tests at minimum: ① a fence containing a line `# not a heading` stays one chunk, path still the section outside the fence; ② a three-row table is never split into “header chunk / body chunk”; ③ `- a` / `  - nested` stay in one chunk; ④ preface with no heading has path `()`. An oversized code fence asserts `end-start` covers the whole fence.
+
+**Follow-ups:** Do you support Setext headings (underlines `===`), and how does the doc mis-chunk if you do not; a fence info string that names markdown, with three backticks in the body—how do you avoid closing early; a heading with no body—drop it, keep an empty chunk, or merge into the next section.
 
 **Extended questions:**
-- Drafts and the current policy sit in the same three thousand files; how does the ingest primary key carry version so the model cannot cite last week’s auth chapter?
-- The query is only “how do we configure that timeout,” with no document name; do you expand coreference before retrieval, and how do you fall back to the raw sentence if the rewrite is wrong?
-- How do you build a “not in the handbook” set that proves the empty-retrieval gate fires before any model call, rather than regretting it after generation?
+- Build a fixture with a list item that looks like a table row; do you treat list before table or the reverse, and why?
+- Why is `heading_path` a tuple in tests, and which test goes dirty if it is a mutable list?
+- If cuts may only land on blank lines, does an oversized paragraph with no blank line get a hard cut, an oversized flag, or a second pass at sentence boundaries?
 
-**Reasoning:** The goal is Monday answers from the current handbook with citations; the constraints are no fabrication without evidence, and ACL/version enforced at retrieve time. Split the path into testable ingest and query functions, keep metadata with the vectors, and refuse before prompt assembly. Accept on current-section recall, zero cites of deleted sections, and zero model calls on the empty-retrieval path.
+**Reasoning:** Align chunks with reading units—section, code, table, list—and carry the path. A character budget must not break those units. So a line-level state machine flushes only on headings, outside fences, and after paragraphs. Accept on the four structural fixtures, not on mean chunk length landing near 500.
 
 ## CODE-013. The ticket store holds about eight thousand rows, grows about 5% each night, and the embedding model has not changed. How do you append only new rows and tombstone deleted tickets so you never re-embed the corpus, and unit-test that a deleted id has zero recall the next day?
 
@@ -579,33 +662,59 @@ def replay(events, t_ms):
 
 **Reasoning:** The goal is a reconstructible, disputable screen at any time. Settled JSON drops the timeline and the visible bytes that were never committed. So persist delta/cancel/timeout/validate with time and seq, fold them purely, and use a half-amount fixture to prove a final snapshot is not enough.
 
-## CODE-019. Fifty thousand tickets need offline labels, each call takes about 3 seconds, and the vendor suddenly returns 429s: how do you write concurrency, jittered backoff, and per-item isolation; what wall-clock time at concurrency 32; how do you slow down when 429s arrive in bursts?
+## CODE-019. An offline job labelling fifty thousand tickets is killed by the OOM killer at about 52%. Results live in `labels.jsonl` as `{ticket_id, label, model, prompt_hash}` per line. How do you checkpoint so a rerun neither drops the 26k successes nor writes two rows for one id, and how do you validate dedup and schema at close-out? Do not make 429 backoff the theme.
 
-**Answer:** Pin in-flight calls with a semaphore (for example 32). Retry only 429, 5xx, and timeouts, sleeping `U(0, min(cap, base·2^attempt))` — full jitter — so coroutines do not retry on the same instant. A document that finally fails is recorded and skipped; the exception must not cancel the whole batch. Wall-clock is about `N × latency / concurrency`: 50000 × 3s / 32 ≈ 4700s, roughly 1.3 hours, excluding retries and rate limits. When 429s arrive in bursts, drop concurrency from the recent 429 fraction and honor Retry-After.
+**Answer:** Successful writes must be idempotent on `ticket_id`: write a temp file then `fsync`+atomic rename, or `INSERT … ON CONFLICT DO NOTHING` in a store with a primary key. The progress cursor and the result file must agree—recording “stopped at row 26000” is not enough, because the kill can land between “the model returned” and “the disk is stable.” On resume, scan committed results into a `done` set, skip those ids in the input stream, and send terminal failures to a dead-letter file that can be replayed alone. Close-out checks: row count, unique `ticket_id` count, zero primary-key collisions, per-row schema, and a sample joined back to the input list.
 
-**Deep dive:** Creating fifty thousand coroutines at once often fits in memory; a bounded queue plus a fixed worker pool back-pressures at the source and is safer. Classify errors: 400 or auth failures are persisted immediately and not retried. Persist successes by document id and skip those ids on rerun so you do not bill twice. Unjittered `base·2^n` aligns retries on the n-th second into a worse storm than the original 429s. Adaptive concurrency can increase slowly after consecutive successes and halve on a 429. Also stack a client-side token limiter so local concurrency can fall while TPM is still over the cap. If the vendor offers an offline batch API, its retry and pricing usually fit this job better; keep the synchronous online API for interactive traffic.
+**Deep dive:** A kill leaves three dirty windows: ① the model already billed but the local row is missing—resume will spend again, so the result key is `ticket_id`, you accept “bill twice rather than lose a label,” and you use a vendor idempotency key if one exists to shrink double billing; ② a half line of JSON on disk—on read, drop the unparseable tail and treat it as incomplete; ③ the cursor ran ahead of the file—rebuild `done` from the file, the cursor is only an accelerator. Layout: `results.jsonl` appends only complete lines (`os.write` of the whole line including `\n`, then `f.flush(); os.fsync(f.fileno())`), `deadletter.jsonl` holds terminal failures, `done` is loaded from both files at start. Do not do heavy I/O in a signal handler; `SIGTERM` only sets a `stop` flag and workers exit between items so the last fsynced line is the boundary. Dedup: if concurrent workers wrote two rows for one id, close-out keeps the first schema-valid row and reports the rest as conflicts—never silently keep two labels. The validator is a pure function shared by CI and the close-out script.
 
 ```python
-sem = asyncio.Semaphore(32)
-async def one(doc):
-    async with sem:
-        for attempt in range(max_retries + 1):
+import json, os
+
+def load_done(path):
+    done = {}
+    with open(path, "a+", encoding="utf-8") as f:
+        f.seek(0)
+        raw = f.read()
+        if raw and not raw.endswith("\n"):
+            raw = raw.rsplit("\n", 1)[0] + "\n"
+        for line in raw.splitlines():
             try:
-                return await call_llm(doc)
-            except Retryable as e:
-                if attempt == max_retries:
-                    return Failed(doc.id, e)
-                await asyncio.sleep(random.uniform(0, min(30.0, 0.5 * 2 ** attempt)))
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tid = row.get("ticket_id")
+            if tid is not None and tid not in done:
+                done[tid] = row
+    return done
+
+def append_row(path, row):
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with open(path, "ab") as out:
+        out.write(line.encode("utf-8"))
+        out.flush(); os.fsync(out.fileno())
+
+def validate(results, expected_ids):
+    ids = [r["ticket_id"] for r in results]
+    return {
+        "n": len(ids),
+        "unique": len(set(ids)),
+        "dupes": len(ids) - len(set(ids)),
+        "missing": sorted(set(expected_ids) - set(ids)),
+        "schema_ok": all({"ticket_id", "label", "model", "prompt_hash"} <= r.keys() for r in results),
+    }
 ```
 
-**Follow-ups:** How a semaphore differs from “fixed workers + queue” on cancel, back-pressure, and memory; after a kill at about 80% progress, how you resume from durable state without double billing; whether you still add your own jitter when Retry-After is 30s.
+Tests: N-1 complete JSON lines plus a half line — `load_done` must not raise and the half-line id is absent from `done`; append the same id twice — `validate` reports `dupes==1`; the resume iterator must call the model zero times for ids already in `done` (count on a fake client).
+
+**Follow-ups:** Results are sharded per tenant—how do the cursor and `done` set avoid dropping an id across shards; labels are an enum and close-out finds 3% of rows outside it—do you void the batch or replay only those ids; the input list gains 2000 rows mid-job—how does resume notice the new ids without rerunning the old.
 
 **Extended questions:**
-- About 30% of failures are context-too-long, so retries are pointless — what pre-check belongs before enqueue?
-- If two workers rerun the same document, how do you make the success write exactly once?
-- Mean 3s and P95 about 12s: how does the 1.3-hour mean-only estimate run short, and how do you change the queueing model?
+- Compare “append jsonl + scan at start” with “sqlite primary key” on crash windows and concurrent workers: which is likelier to stay at exactly one row.
+- How do you inject a fake SIGTERM after the call returns but before fsync, to prove a half line is treated as incomplete?
+- Close-out `unique` matches the input list, yet every label could still be the same default—which business check is still missing?
 
-**Reasoning:** Constraints are: do not melt the vendor, do not stop the batch on one bad document, and keep wall-clock predictable. Those pick the semaphore, full-jitter backoff, and per-item catch. Accept with retry classification, checkpoint ids, and the 429 fraction together, not a single final success rate.
+**Reasoning:** Resume from committed results after a kill, with at most one valid label per ticket. Billing may already have happened and the disk may stop mid-line. So the result file is the authoritative `done` set, whole lines are fsynced, and close-out checks uniqueness and schema. Accept on the half-line fixture, duplicate-id reports, and zero repeat model calls on resume.
 
 ## CODE-020. The gateway must hit on identical "model + sampling params + messages" requests with O(1) get/put, and expired entries must not occupy capacity forever: which list pairs with the hash map, and who runs first — lazy TTL or LRU eviction?
 
@@ -917,41 +1026,70 @@ def misbind(answer, chunks):
 
 **Reasoning:** The goal is to catch attributes that drifted across entities, not to rerun sentence faithfulness. NLI may pass whenever the number exists somewhere. So extract triples on both sides, join by sku equality, and log the foreign entity and chunk. Accept when two real SKUs with swapped days go red.
 
-## CODE-031. Two summarization prompts must be compared on faithfulness, and the gate is “are the SKU and return window written correctly”, not a 1–5 score. How do you write slot checks as a deterministic CI checker, keep the LLM only for explaining failures, and say when a legitimate paraphrase will be false-killed?
+## CODE-031. A browser client parses the model’s SSE byte stream itself. TCP splits the UTF-8 for 你 (`E4 BD A0`) after `E4`, and the next chunk carries `BD A0`; a `data:` line and the terminating blank line also arrive in different packets; the stream may end with `data: [DONE]` or with `event: error` first. How do you write and test the decoder so Chinese does not become U+FFFD and a half event is never parsed as complete JSON?
 
-**Answer:** Extract canonical slots from the source ticket (the SKU set, return days as integers) and extract them again from the summary; the Boolean gate is equality, or “source ⊆ summary and no extra SKU/day”. CI consumes only the checker’s pass/fail, never a judge model’s mean. The LLM writes a human-readable note on failed rows only; that prose must not rewrite the gate. Legitimate paraphrases that false-kill: “30 days” written as “one month”, “SKU-4412” as “style 4412”, “14 days” as “two weeks” — an extractor that recognizes only one surface form will fail a correct summary.
+**Answer:** Two buffers. The byte layer decodes only through the last complete code point and holds leftover bytes for the next chunk. The text layer frames SSE and flushes an event only on a blank line. `event` defaults to `message`; multiple `data:` lines join with `\n`. `data: [DONE]` (with or without spaces) is a normal end, not a delta to `json.loads`. `event: error` goes to the error callback and ends the stream; do not wait for `[DONE]` after it. Never `bytes.decode("utf-8", "replace")` per TCP chunk—that is exactly how mojibake appears.
 
-**Deep dive:** The checker is a pure function: `slots(src) → {skus: set[str], return_days: set[int]}`, same on the summary. Example pass rule: `sum_skus == src_skus` (or allow the summary to omit a SKU the user did not ask about, but never to invent one), and `return_days` must match the source with no second day count. Implement with regex plus a tiny alias table (`sku/style/货号` → SKU; `day/days/天/日` → days). Do not run entailment inside the gate. Scale: 200 frozen tickets, milliseconds each, cheap enough to run on every prompt change; then send about 10–20 failures to an LLM for notes like “summary wrote 90, source is 30”. Notes go in the report, not into the exit code. Keep a separate gold list of false-kill cases: number-words, unit conversion, SKU separators, dropped `SKU-` prefixes. Keep a miss list too: source 30 days, summary 30 days but the SKU swapped for another real SKU — that must fail, and it is the checker’s main value. Do not add n-gram overlap as a second gate; it will pass a wrong day count.
+**Deep dive:** Even if the server flushes on code points, a proxy may still cut TCP at an arbitrary length. The client must not assume “one chunk = one event” or “one chunk = valid UTF-8.” State: `byte_buf`, `line_acc`, and the current event’s `event/id/data_parts`. `feed(chunk)`: append to `byte_buf`, take a complete UTF-8 prefix (incremental decode or a hand-rolled valid-prefix cut), and wait on a truncated sequence instead of replacing it. Split `text` on `\n` (accept `\r\n`), keep the last partial line in `line_acc`. On a blank line, assemble `{"event","id","data"}` and clear the current fields; if this event omitted `id`, inherit the previous one (SSE default)—for a single completion you may ignore id. Compare `[DONE]` on `data.strip()` so `data: [DONE]\n` with spaces still matches. Error `data` may be a JSON object or plain text; the decoder delivers it and does not retry here. Do not mix this with the multiplex-by-id question: assume one stream and focus on byte boundaries and framing.
 
 ```python
-import re
-SKU = re.compile(r"(?:SKU[- ]?|货号\s*)(\d{3,})", re.I)
-DAY = re.compile(r"(\d{1,3})\s*(?:天|日|days?)", re.I)
-ALIAS_DAYS = {"一个月": 30, "one month": 30, "two weeks": 14, "两周": 14, "一周": 7}
+class SseDecoder:
+    def __init__(self):
+        self.byte_buf = b""
+        self.line_acc = ""
+        self.event, self.eid, self.data = "message", None, []
+        self.last_id = None
+    def _flush_event(self):
+        data = "\n".join(self.data)
+        ev = {"event": self.event, "id": self.eid if self.eid is not None else self.last_id, "data": data}
+        if self.eid:
+            self.last_id = self.eid
+        self.event, self.eid, self.data = "message", None, []
+        return ev
+    def feed(self, chunk: bytes):
+        self.byte_buf += chunk
+        n = _utf8_complete_len(self.byte_buf)
+        text = self.byte_buf[:n].decode("utf-8")
+        self.byte_buf = self.byte_buf[n:]
+        out, buf = [], self.line_acc + text.replace("\r\n", "\n").replace("\r", "\n")
+        parts = buf.split("\n")
+        self.line_acc = parts.pop()
+        for line in parts:
+            if line == "":
+                out.append(self._flush_event()); continue
+            if line.startswith(":"):
+                continue
+            name, _, val = line.partition(":")
+            val = val[1:] if val.startswith(" ") else val
+            if name == "event":
+                self.event = val
+            elif name == "data":
+                self.data.append(val)
+            elif name == "id":
+                self.eid = val
+        return out
 
-def slots(text):
-    days = {int(n) for n, _ in DAY.findall(text)}
-    for phrase, n in ALIAS_DAYS.items():
-        if phrase in text:
-            days.add(n)
-    return {s.lstrip("0") or "0" for s in SKU.findall(text)}, days
-
-def faithful(src, summary):
-    s_sku, s_day = slots(src)
-    o_sku, o_day = slots(summary)
-    return o_sku <= s_sku and o_sku and s_day == o_day
+def _utf8_complete_len(b):
+    i = len(b)
+    while i > 0 and (b[i-1] & 0xC0) == 0x80:
+        i -= 1
+    if i == 0:
+        return 0
+    lead, rest = b[i-1], len(b) - i
+    need = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+    return len(b) if rest + 1 >= need else i - 1
 ```
 
-CI: run the frozen set on both prompts and compare `faithful` pass rate; the LLM only `explain(src, summary, slots)`.
+Tests feed raw bytes, not pre-decoded strings: ① `b"data: " + bytes.fromhex("e4")` on one `feed` must not emit U+FFFD; after `feed(bytes.fromhex("bda0") + b"\\n\\n")`, `data=="你"`; ② `b"data: {\\n"` then `b"\\n}\\n\\n"` — first call yields no event, second has `data` `{\n}`; ③ `data: [DONE]\\n\\n` ends the stream and is not `json.loads`’d; ④ `event: error\\ndata: boom\\n\\n` has `event=="error"`.
 
-**Follow-ups:** If the source has two SKUs and the user asked about one, does a one-SKU summary pass; do you parse “30–45 days” as two points or as an interval object; if the alias table maps “one month” to 30 and the source meant a calendar month, is that a false kill or a miss.
+**Follow-ups:** If `errors="replace"` is used by mistake, U+FFFD is already on screen—how does a test forbid that path; does a comment line `: keep-alive` flush; a `data:` field that is empty concatenates as a blank line of unknown length per spec—how do you avoid treating it as the event terminator.
 
 **Extended questions:**
-- Versioning the alias table as checker config, versus letting an LLM do the conversion — which kind of CI jitter does each introduce?
-- How do you place paired “legal paraphrase” and “stolen days from another SKU” items in the freeze set so the gate is clearly not string overlap?
-- If the explanation model says 30 is “basically 90”, how does the report stop on-call from treating that sentence as a reason to override the gate?
+- Draw two state machines, code-point buffer versus event buffer, and name the failure each layer causes if you implement only that layer.
+- How do you property-test by cutting a valid SSE byte string at a random offset and asserting `feed` reconstitutes the same event sequence?
+- `[DONE]` in `event: message` data versus a comment line: what product difference, and should the decoder unify them into one ended callback?
 
-**Reasoning:** The goal is to compare two summary prompts on wrong SKUs and wrong day counts. Likert scores lock in a judge’s taste; overlap metrics pass numeric errors. So the gate is a recomputable slot predicate, the LLM only annotates failures, and alias gold measures the false-kill surface.
+**Reasoning:** Chinese must survive arbitrary TCP cuts, and events must not be half-parsed. UTF-8 completeness and SSE blank-line framing are two different integrity layers. Wait for a code point at the byte layer, wait for a blank line at the text layer, and do not treat `[DONE]` or `error` as incremental JSON. Accept on the four byte fixtures, not on already-decoded strings as input.
 
 ## CODE-032. An off-topic classifier must run on the incomplete hypothesis every N tokens without blowing TTFT. How do you run the small classifier in parallel with decode, and how do you decide when the score flips from “looks off-topic mid-way” back to on-topic after 120 tokens?
 
