@@ -390,7 +390,7 @@ def cite_ok(claimed, src_tag):
 
 **答：** 按行扫描，维护三块状态：标题栈、是否在围栏内、当前块缓冲。碰到新标题且不在围栏里才 flush 上一块并更新路径；围栏以行首三个反引号或三个波浪号开关，围栏内的 `#`、`|`、`- ` 一律当正文。表格是连续的 `|` 行（可含分隔行），列表是连续的无序/有序列表行——这两种在 flush 时要么整段留下，要么整段跟下一块，禁止在表行或列表项中间切开。块对象带 `heading_path`、起止行号和原文切片。
 
-**深入展开：** 状态机的关键不是「按字符数硬切」，而是「只在安全边界切」。安全边界：空行后的段落起点、标题行、围栏开关行的外侧。不安全：围栏内、表的中间行、同一列表的中间项。超长围栏（示意超过 800 字符的示例代码）整块保留并打 `oversized=True`，让检索侧决定要不要再按语言切——切块器不得在开启围栏行和闭合围栏行之间插入切点。标题栈按级别弹出：遇到 `##` 就弹掉更深的 `###`，路径用 ` > ` 拼接，前言（第一个标题之前）路径为空列表。不要在切块器里做 HTML 注释剥离或嵌入，那是入库清洗的责任——这里只保证结构单元完整。
+**深入展开：** 状态机的关键不是「按字符数硬切」，而是「只在安全边界切」。安全边界：空行后的段落起点、标题行、围栏开关行的外侧。不安全：围栏内、表的中间行、同一列表的中间项。超长围栏（示意超过 800 字符的示例代码）整块保留并打 `oversized=True`，让检索侧决定要不要再按语言切——切块器不得在开启围栏行和闭合围栏行之间插入切点。标题栈按级别弹出：遇到 `##` 就弹掉更深的 `###`，路径以元组保存、展示时用 ` > ` 拼接，前言（第一个标题之前）路径为空元组。不要在切块器里做 HTML 注释剥离或嵌入，那是入库清洗的责任——这里只保证结构单元完整。
 
 ```python
 import re
@@ -406,7 +406,8 @@ def chunk_markdown(src, max_chars=800):
     def flush(end):
         text = "".join(buf)
         if text.strip():
-            out.append({"heading_path": tuple(path), "start": start, "end": end, "text": text})
+            out.append({"heading_path": tuple(path), "start": start, "end": end,
+                        "text": text, "oversized": len(text) > max_chars})
         buf.clear()
     i = 0
     while i < len(lines):
@@ -450,7 +451,7 @@ def chunk_markdown(src, max_chars=800):
     return out
 ```
 
-单测至少四条：①围栏内有一行 `# 不是标题`，切完后该围栏仍是同一块，路径仍是围栏外那个节；②三行表不得被切成「表头一块、数据行一块」；③`- a` / `  - nested` 连续列表同块；④无标题前言路径为 `()`。超长代码块断言 `end-start` 覆盖整个围栏。
+单测至少四条：①围栏内有一行 `# 不是标题`，切完后该围栏仍是同一块，路径仍是围栏外那个节；②三行表不得被切成「表头一块、数据行一块」；③`- a` / `  - nested` 连续列表同块；④无标题前言路径为 `()`。超长代码块断言 `end-start` 覆盖整个围栏且 `oversized` 为 True。
 
 **后续追问：** Setext 标题（下划线 `===`）要不要支持，不支持时文档会怎样被切错；围栏 info string 标明 markdown、内部正文又出现三个反引号时，你怎样避免提前闭合；一块只有标题没有正文，是丢弃、是保留空块，还是并入下一节。
 
@@ -666,7 +667,7 @@ def replay(events, t_ms):
 
 **答：** 成功写入必须对 `ticket_id` 幂等：先写临时文件再 `fsync`+原子改名，或用带主键的库 `INSERT … ON CONFLICT DO NOTHING`。进度游标与结果要能互相核验——只记「跑到第 26000 行」不够，因为杀进程可能发生在「模型已返回、磁盘未落稳」之间。续跑时先扫描已提交结果建成 `done` 集合，输入流跳过这些 id，失败行进死信文件可单独重放。收工校验：行数、唯一 `ticket_id` 数、主键冲突数为 0，每行过 schema，抽若干条对照输入清单。
 
-**深入展开：** 杀进程的窗口有三种脏状态：①模型已计费但本地无行——续跑会再花一次钱，所以结果键必须是 `ticket_id`，接受「宁可重复计费一次、也不丢标签」，并用供应商侧若有的幂等键降低双计费；②磁盘上有半行 JSON——读取时丢掉无法解析的最后一行，当作未完成；③游标超前于文件——以文件为准重建 `done`，游标只是加速。推荐布局：`results.jsonl` 只追加完整行（写 `os.write` 整行含 `\n` 后 `f.flush(); os.fsync(f.fileno())`），`deadletter.jsonl` 记最终失败，`done` 在启动时从两份文件加载。不要在信号处理器里做复杂 I/O；注册 `SIGTERM` 只设 `stop` 标志，worker 在两条之间退出，让最后一次 fsync 的行成为边界。去重：同一 id 若因并发 worker 写了两行，收工扫描保留第一条合法 schema、其余进冲突报告，禁止静默各留各的标签。校验器是纯函数，CI 和收工脚本共用。
+**深入展开：** 杀进程的窗口有三种脏状态：①模型已计费但本地无行——续跑会再花一次钱，所以结果键必须是 `ticket_id`，接受「宁可重复计费一次、也不丢标签」，并用供应商侧若有的幂等键降低双计费；②磁盘上有半行 JSON——读取时丢掉无法解析的最后一行，当作未完成；③游标超前于文件——以文件为准重建 `done`，游标只是加速。推荐布局：`results.jsonl` 只追加完整行（整行含 `\n` 一次 `write`，再 `flush()` + `os.fsync(fileno())`），`deadletter.jsonl` 记最终失败，`done` 在启动时从两份文件加载。不要在信号处理器里做复杂 I/O；注册 `SIGTERM` 只设 `stop` 标志，worker 在两条之间退出，让最后一次 fsync 的行成为边界。OOM killer 发的是 SIGKILL，捕获不到，所以正确性只能靠整行 fsync 加启动时重建 `done`，优雅退出只是锦上添花。去重：同一 id 若因并发 worker 写了两行，收工扫描保留第一条合法 schema、其余进冲突报告，禁止静默各留各的标签。校验器是纯函数，CI 和收工脚本共用。
 
 ```python
 import json, os
@@ -711,7 +712,7 @@ def validate(results, expected_ids):
 
 **扩展问题：**
 - 比较「jsonl 追加 + 启动扫描」和「sqlite 主键」，崩溃窗口和并发 worker 下谁更容易保证恰好一行。
-- 怎样用假的 SIGTERM 在「call 返回之后、fsync 之前」注入一次崩溃，证明半行会被当成未完成？
+- 怎样在「call 返回之后、fsync 之前」用 SIGKILL 注入一次崩溃，证明半行会被当成未完成？
 - 收工报告里 `unique` 等于输入清单，但仍可能标签全是同一个默认值——还缺哪条业务校验？
 
 **推理回答：** 目标是杀进程后从已提交结果继续，且每个工单至多一行合法标签。约束是计费可能已发生、磁盘可能停在半行。所以以结果文件为权威 `done` 集，整行 fsync，收工做唯一性与 schema 校验。验收看半行夹具、重复 id 报告和续跑零次重复调用。
@@ -1028,59 +1029,65 @@ def misbind(answer, chunks):
 
 ## CODE-031. 浏览器客户端自己解析模型的 SSE 字节流：TCP 把 UTF-8 汉字「你」（`E4 BD A0`）切在 `E4` 与 `BD A0` 之间，下一个 chunk 才到；事件的 `data:` 行和结尾空行也不在同一包；流可能以 `data: [DONE]` 结束，也可能先来 `event: error`。解码器怎样写、怎样测，才不会把汉字打成 U+FFFD，也不会把半个事件当成完整 JSON？
 
-**答：** 解码器分两层缓冲：字节层只 `decode` 到最后一个完整码点，残余字节留到下一块；文本层按 SSE 组帧，只有碰到空行才 flush 一个事件。`event` 默认 `message`，多条 `data:` 用 `\n` 拼；`data: [DONE]`（可带或不带空格）是正常结束，不是一条要 `json.loads` 的增量；`event: error` 走错误回调，随后结束，不要再等 `[DONE]`。禁止对每个 TCP chunk 做 `bytes.decode("utf-8", "replace")`，那正是出现乱码的原因。
+**答：** 解码器分两层：字节层用增量 UTF-8 解码器，被切开的合法多字节留到下一块再出字；文本层按 SSE 组帧，只有碰到空行才 flush 一个事件。`event` 默认 `message`，多条 `data:` 用 `\n` 拼；`data: [DONE]`（可带或不带空格）是正常结束，不是一条要 `json.loads` 的增量；`event: error` 走错误回调，随后结束，不要再等 `[DONE]`。禁止对每个 TCP chunk 做 `bytes.decode("utf-8", "replace")`，那正是出现乱码的原因。
 
-**深入展开：** 服务端就算按码点冲刷，中间代理仍可能按任意长度切 TCP。客户端因此不能假设「一块 = 一个事件」或「一块 = 合法 UTF-8」。状态：`byte_buf`、`line_acc`、当前事件的 `event/id/data_parts`。`feed(chunk)`：`byte_buf += chunk`，用 `decode("utf-8")` 的增量接口或自写「合法前缀」切出 `text`，非法续列等待而不是替换。`text` 按 `\n`（兼容 `\r\n`）切行，最后半行留在 `line_acc`。空行：组装 `{"event", "id", "data"}` 后清当前事件字段；`id` 若本事件未出现则继承上一个（SSE 默认），本题若只有单路补全可以忽略 id。`[DONE]` 比较应在 `data.strip()` 上做，避免 `data: [DONE]\n` 带空白漏匹配。错误事件的 `data` 可以是 JSON 对象或纯文本，解码器只负责递出，不在这里做业务重试。不要和多路复用那题搅在一起：这里假设一路，专攻字节边界与组帧。
+**深入展开：** 服务端就算按码点冲刷，中间代理仍可能按任意长度切 TCP。客户端因此不能假设「一块 = 一个事件」或「一块 = 合法 UTF-8」。状态：`byte_buf`、`line_acc`、当前事件的 `event/id/data_parts`。`feed(chunk)`：`byte_buf += chunk`，用 `codecs` 的增量 UTF-8 解码器切出 `text`：被切开的合法多字节等待下一块，只有真正非法的字节才替换成 U+FFFD（规范里的 UTF-8 解码也是这样）；首块开头的 BOM 去掉。按规范 `\r\n`、`\n`、`\r` 都是行尾；`\r` 恰好落在块尾时不能立刻当行尾，要等下一块看是不是 `\r\n`，否则 CRLF 被切开会多出一个空行。最后半行留在 `line_acc`。空行：data 缓冲为空（只有注释、只有 `event:`）就不派发，只清字段；非空才组装 `{"event", "id", "data"}`，`event` 为空时记作 `message`。`id` 写入「上一事件 id」缓冲并一直沿用到下次出现（含 NUL 的 id 忽略），本题若只有单路补全可以忽略 id。`[DONE]` 比较应在 `data.strip()` 上做，避免 `data: [DONE]\n` 带空白漏匹配。错误事件的 `data` 可以是 JSON 对象或纯文本，解码器只负责递出，不在这里做业务重试。不要和多路复用那题搅在一起：这里假设一路，专攻字节边界与组帧。
 
 ```python
+import codecs
+
 class SseDecoder:
     def __init__(self):
-        self.byte_buf = b""
+        self._utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.line_acc = ""
-        self.event, self.eid, self.data = "message", None, []
-        self.last_id = None
-    def _flush_event(self):
-        data = "\n".join(self.data)
-        ev = {"event": self.event, "id": self.eid if self.eid is not None else self.last_id, "data": data}
-        if self.eid:
-            self.last_id = self.eid
-        self.event, self.eid, self.data = "message", None, []
-        return ev
+        self.first = True
+        self.event, self.data = "", []
+        self.last_id = ""
+    def _dispatch(self):
+        data, event = self.data, self.event or "message"
+        self.event, self.data = "", []
+        if not data:
+            return None
+        return {"event": event, "id": self.last_id, "data": "\n".join(data)}
+    def _line(self, line, out):
+        if line == "":
+            ev = self._dispatch()
+            if ev is not None:
+                out.append(ev)
+            return
+        if line.startswith(":"):
+            return
+        name, _, val = line.partition(":")
+        if val.startswith(" "):
+            val = val[1:]
+        if name == "event":
+            self.event = val
+        elif name == "data":
+            self.data.append(val)
+        elif name == "id" and "\0" not in val:
+            self.last_id = val
     def feed(self, chunk: bytes):
-        self.byte_buf += chunk
-        n = _utf8_complete_len(self.byte_buf)
-        text = self.byte_buf[:n].decode("utf-8")
-        self.byte_buf = self.byte_buf[n:]
-        out, buf = [], self.line_acc + text.replace("\r\n", "\n").replace("\r", "\n")
-        parts = buf.split("\n")
-        self.line_acc = parts.pop()
-        for line in parts:
-            if line == "":
-                out.append(self._flush_event()); continue
-            if line.startswith(":"):
-                continue
-            name, _, val = line.partition(":")
-            val = val[1:] if val.startswith(" ") else val
-            if name == "event":
-                self.event = val
-            elif name == "data":
-                self.data.append(val)
-            elif name == "id":
-                self.eid = val
+        text = self._utf8.decode(chunk)
+        if self.first and text:
+            text = text.removeprefix("\ufeff")
+            self.first = False
+        buf = self.line_acc + text
+        out, start, i, n = [], 0, 0, len(buf)
+        while i < n:
+            c = buf[i]
+            if c == "\n" or c == "\r":
+                if c == "\r" and i + 1 == n:
+                    break
+                self._line(buf[start:i], out)
+                i += 2 if c == "\r" and buf[i + 1] == "\n" else 1
+                start = i
+            else:
+                i += 1
+        self.line_acc = buf[start:]
         return out
-
-def _utf8_complete_len(b):
-    i = len(b)
-    while i > 0 and (b[i-1] & 0xC0) == 0x80:
-        i -= 1
-    if i == 0:
-        return 0
-    lead, rest = b[i-1], len(b) - i
-    need = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
-    return len(b) if rest + 1 >= need else i - 1
 ```
 
-单测用字节夹具，不要先 `.decode()` 再喂：①`b"data: " + bytes.fromhex("e4")` 一次 `feed` 不得产出 U+FFFD，再 `feed(bytes.fromhex("bda0") + b"\n\n")` 后 `data=="你"`；②`b"data: {\n"` 与 `b"data: }\n\n"` 两次 feed，第一次事件列表为空，第二次 `data` 为 `{\n}`；③`data: [DONE]\n\n` 标记结束且不要 `json.loads`；④`event: error\ndata: boom\n\n` 的 `event=="error"`。
+单测用字节夹具，不要先 `.decode()` 再喂：①`b"data: " + bytes.fromhex("e4")` 一次 `feed` 不得产出 U+FFFD，再 `feed(bytes.fromhex("bda0") + b"\n\n")` 后 `data=="你"`；②`b"data: {\n"` 与 `b"data: }\n\n"` 两次 feed，第一次事件列表为空，第二次 `data` 为 `{\n}`；③`data: [DONE]\n\n` 标记结束且不要 `json.loads`；④`event: error\ndata: boom\n\n` 的 `event=="error"`；⑤`b"data: a\r"` 与 `b"\n\r\n"` 两次 feed，CRLF 被切开也只产出一个 `data=="a"` 的事件；⑥`b": ping\n\n"` 与 `b"event: x\n\n"` 都不产出事件（data 缓冲为空不派发）；⑦`b"data:\n\n"` 产出一个 `data==""` 的事件。
 
 **后续追问：** `errors="replace"` 一旦误用，U+FFFD 会写进已经上屏的字，你怎样在测试里禁掉这条路径；注释行 `: keep-alive` 是否 flush；`data:` 空值按规范是向 data 缓冲追加一个空串（拼接后多出一个换行），你怎样避免把它当成事件结束。
 
@@ -1089,7 +1096,7 @@ def _utf8_complete_len(b):
 - 如何用随机切分（把一段合法 SSE 在任意字节处切开再 `feed`）做属性测试，断言重组后事件序列不变？
 - `[DONE]` 写在 `event: message` 的 data 里，和写成单独注释行，产品语义差在哪，解码器要不要统一成同一种结束回调？
 
-**推理回答：** 目标是任意 TCP 切分下汉字不乱、事件不残。约束是 UTF-8 与 SSE 空行组帧是两层不同的完整性。所以字节层等码点、文本层等空行，`[DONE]` 与 `error` 不当增量 JSON。验收看四条字节夹具，而不是用已经 decode 好的字符串当输入。
+**推理回答：** 目标是任意 TCP 切分下汉字不乱、事件不残。约束是 UTF-8 与 SSE 空行组帧是两层不同的完整性。所以字节层等码点、文本层等空行，`[DONE]` 与 `error` 不当增量 JSON。验收看七条字节夹具，而不是用已经 decode 好的字符串当输入。
 
 ## CODE-032. 不得拖爆首字时延 TTFT，却每隔 N 个 token 就要在尚未写完的草稿上跑一次偏题分类。怎样安排这个轻量分类器跟 decode 一起并行？写到一半像跑题、生成到第 120 个 token 又拉回正题时，分数来回翻转怎么拍板？
 

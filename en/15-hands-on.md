@@ -390,7 +390,7 @@ Unit test: `tag_chunk("results", "Revenue (non-GAAP)") == "non_gaap"` and `cite_
 
 **Answer:** Scan line by line with three pieces of state: the heading stack, whether you are inside a fence, and the current chunk buffer. Flush and update the path only on a new heading that is not inside a fence. Fences toggle on a line-leading run of three backticks or three tildes; `#`, `|`, and `- ` inside a fence are body text. A table is a run of `|` lines (plus the delimiter row); a list is a run of unordered/ordered items. On flush, those runs stay whole with this chunk or move whole to the next—never cut mid-row or mid-item. Each chunk object carries `heading_path`, start/end line, and the source slice.
 
-**Deep dive:** The point is not “cut every N characters,” it is “cut only on a safe boundary.” Safe: start of a paragraph after a blank line, a heading line, outside a fence toggle. Unsafe: inside a fence, mid-table, mid-list. An oversized fence (illustrative: sample code longer than 800 characters) is kept intact and tagged `oversized=True` so retrieval can decide on a language-aware split later—the chunker must not insert a cut between the opening fence line and the closing fence line. The heading stack pops by level: a `##` drops any deeper `###`; join with ` > `; preface before the first heading has an empty path. Do not strip HTML comments or embed here—that is a cleaner’s job; this function only keeps structural units intact.
+**Deep dive:** The point is not “cut every N characters,” it is “cut only on a safe boundary.” Safe: start of a paragraph after a blank line, a heading line, outside a fence toggle. Unsafe: inside a fence, mid-table, mid-list. An oversized fence (illustrative: sample code longer than 800 characters) is kept intact and tagged `oversized=True` so retrieval can decide on a language-aware split later—the chunker must not insert a cut between the opening fence line and the closing fence line. The heading stack pops by level: a `##` drops any deeper `###`; the path is stored as a tuple and joined with ` > ` for display; preface before the first heading has the empty tuple. Do not strip HTML comments or embed here—that is a cleaner’s job; this function only keeps structural units intact.
 
 ```python
 import re
@@ -406,7 +406,8 @@ def chunk_markdown(src, max_chars=800):
     def flush(end):
         text = "".join(buf)
         if text.strip():
-            out.append({"heading_path": tuple(path), "start": start, "end": end, "text": text})
+            out.append({"heading_path": tuple(path), "start": start, "end": end,
+                        "text": text, "oversized": len(text) > max_chars})
         buf.clear()
     i = 0
     while i < len(lines):
@@ -450,7 +451,7 @@ def chunk_markdown(src, max_chars=800):
     return out
 ```
 
-Four tests at minimum: ① a fence containing a line `# not a heading` stays one chunk, path still the section outside the fence; ② a three-row table is never split into “header chunk / body chunk”; ③ `- a` / `  - nested` stay in one chunk; ④ preface with no heading has path `()`. An oversized code fence asserts `end-start` covers the whole fence.
+Four tests at minimum: ① a fence containing a line `# not a heading` stays one chunk, path still the section outside the fence; ② a three-row table is never split into “header chunk / body chunk”; ③ `- a` / `  - nested` stay in one chunk; ④ preface with no heading has path `()`. An oversized code fence asserts `end-start` covers the whole fence and `oversized` is True.
 
 **Follow-ups:** Do you support Setext headings (underlines `===`), and how does the doc mis-chunk if you do not; a fence info string that names markdown, with three backticks in the body—how do you avoid closing early; a heading with no body—drop it, keep an empty chunk, or merge into the next section.
 
@@ -666,7 +667,7 @@ def replay(events, t_ms):
 
 **Answer:** Successful writes must be idempotent on `ticket_id`: write a temp file then `fsync`+atomic rename, or `INSERT … ON CONFLICT DO NOTHING` in a store with a primary key. The progress cursor and the result file must agree—recording “stopped at row 26000” is not enough, because the kill can land between “the model returned” and “the disk is stable.” On resume, scan committed results into a `done` set, skip those ids in the input stream, and send terminal failures to a dead-letter file that can be replayed alone. Close-out checks: row count, unique `ticket_id` count, zero primary-key collisions, per-row schema, and a sample joined back to the input list.
 
-**Deep dive:** A kill leaves three dirty windows: ① the model already billed but the local row is missing—resume will spend again, so the result key is `ticket_id`, you accept “bill twice rather than lose a label,” and you use a vendor idempotency key if one exists to shrink double billing; ② a half line of JSON on disk—on read, drop the unparseable tail and treat it as incomplete; ③ the cursor ran ahead of the file—rebuild `done` from the file, the cursor is only an accelerator. Layout: `results.jsonl` appends only complete lines (`os.write` of the whole line including `\n`, then `f.flush(); os.fsync(f.fileno())`), `deadletter.jsonl` holds terminal failures, `done` is loaded from both files at start. Do not do heavy I/O in a signal handler; `SIGTERM` only sets a `stop` flag and workers exit between items so the last fsynced line is the boundary. Dedup: if concurrent workers wrote two rows for one id, close-out keeps the first schema-valid row and reports the rest as conflicts—never silently keep two labels. The validator is a pure function shared by CI and the close-out script.
+**Deep dive:** A kill leaves three dirty windows: ① the model already billed but the local row is missing—resume will spend again, so the result key is `ticket_id`, you accept “bill twice rather than lose a label,” and you use a vendor idempotency key if one exists to shrink double billing; ② a half line of JSON on disk—on read, drop the unparseable tail and treat it as incomplete; ③ the cursor ran ahead of the file—rebuild `done` from the file, the cursor is only an accelerator. Layout: `results.jsonl` appends only complete lines (one `write` of the whole line including `\n`, then `flush()` + `os.fsync(fileno())`), `deadletter.jsonl` holds terminal failures, `done` is loaded from both files at start. Do not do heavy I/O in a signal handler; `SIGTERM` only sets a `stop` flag and workers exit between items so the last fsynced line is the boundary. The OOM killer sends SIGKILL, which cannot be caught, so correctness rests on whole-line fsync plus rebuilding `done` at start; graceful exit is only a bonus. Dedup: if concurrent workers wrote two rows for one id, close-out keeps the first schema-valid row and reports the rest as conflicts—never silently keep two labels. The validator is a pure function shared by CI and the close-out script.
 
 ```python
 import json, os
@@ -711,7 +712,7 @@ Tests: N-1 complete JSON lines plus a half line — `load_done` must not raise a
 
 **Extended questions:**
 - Compare “append jsonl + scan at start” with “sqlite primary key” on crash windows and concurrent workers: which is likelier to stay at exactly one row.
-- How do you inject a fake SIGTERM after the call returns but before fsync, to prove a half line is treated as incomplete?
+- How do you inject a crash with SIGKILL after the call returns but before fsync, to prove a half line is treated as incomplete?
 - Close-out `unique` matches the input list, yet every label could still be the same default—which business check is still missing?
 
 **Reasoning:** Resume from committed results after a kill, with at most one valid label per ticket. Billing may already have happened and the disk may stop mid-line. So the result file is the authoritative `done` set, whole lines are fsynced, and close-out checks uniqueness and schema. Accept on the half-line fixture, duplicate-id reports, and zero repeat model calls on resume.
@@ -1028,59 +1029,65 @@ def misbind(answer, chunks):
 
 ## CODE-031. A browser client parses the model’s SSE byte stream itself. TCP splits the UTF-8 for 你 (`E4 BD A0`) after `E4`, and the next chunk carries `BD A0`; a `data:` line and the terminating blank line also arrive in different packets; the stream may end with `data: [DONE]` or with `event: error` first. How do you write and test the decoder so Chinese does not become U+FFFD and a half event is never parsed as complete JSON?
 
-**Answer:** Two buffers. The byte layer decodes only through the last complete code point and holds leftover bytes for the next chunk. The text layer frames SSE and flushes an event only on a blank line. `event` defaults to `message`; multiple `data:` lines join with `\n`. `data: [DONE]` (with or without spaces) is a normal end, not a delta to `json.loads`. `event: error` goes to the error callback and ends the stream; do not wait for `[DONE]` after it. Never `bytes.decode("utf-8", "replace")` per TCP chunk—that is exactly how mojibake appears.
+**Answer:** Two layers. The byte layer uses an incremental UTF-8 decoder, so a valid multibyte sequence that was cut waits for the next chunk. The text layer frames SSE and flushes an event only on a blank line. `event` defaults to `message`; multiple `data:` lines join with `\n`. `data: [DONE]` (with or without spaces) is a normal end, not a delta to `json.loads`. `event: error` goes to the error callback and ends the stream; do not wait for `[DONE]` after it. Never `bytes.decode("utf-8", "replace")` per TCP chunk—that is exactly how mojibake appears.
 
-**Deep dive:** Even if the server flushes on code points, a proxy may still cut TCP at an arbitrary length. The client must not assume “one chunk = one event” or “one chunk = valid UTF-8.” State: `byte_buf`, `line_acc`, and the current event’s `event/id/data_parts`. `feed(chunk)`: append to `byte_buf`, take a complete UTF-8 prefix (incremental decode or a hand-rolled valid-prefix cut), and wait on a truncated sequence instead of replacing it. Split `text` on `\n` (accept `\r\n`), keep the last partial line in `line_acc`. On a blank line, assemble `{"event","id","data"}` and clear the current fields; if this event omitted `id`, inherit the previous one (SSE default)—for a single completion you may ignore id. Compare `[DONE]` on `data.strip()` so `data: [DONE]\n` with spaces still matches. Error `data` may be a JSON object or plain text; the decoder delivers it and does not retry here. Do not mix this with the multiplex-by-id question: assume one stream and focus on byte boundaries and framing.
+**Deep dive:** Even if the server flushes on code points, a proxy may still cut TCP at an arbitrary length. The client must not assume “one chunk = one event” or “one chunk = valid UTF-8.” State: `byte_buf`, `line_acc`, and the current event’s `event/id/data_parts`. `feed(chunk)`: append to `byte_buf`, decode with an incremental UTF-8 decoder from `codecs`: a valid but cut multibyte sequence waits for the next chunk, and only truly invalid bytes become U+FFFD (as the spec’s UTF-8 decode does); strip a BOM at the very start. Per the spec, `\r\n`, `\n`, and `\r` all end a line; a `\r` that lands exactly at the end of a chunk cannot be treated as a line end yet—wait for the next chunk to see whether it is `\r\n`, or a split CRLF produces an extra blank line. Keep the last partial line in `line_acc`. On a blank line, if the data buffer is empty (only comments, only `event:`), do not dispatch—just reset fields; otherwise assemble `{"event","id","data"}`, with an empty event type reported as `message`. `id` sets the last-event-id buffer, which persists until the next `id` (ids containing NUL are ignored)—for a single completion you may ignore id. Compare `[DONE]` on `data.strip()` so `data: [DONE]\n` with spaces still matches. Error `data` may be a JSON object or plain text; the decoder delivers it and does not retry here. Do not mix this with the multiplex-by-id question: assume one stream and focus on byte boundaries and framing.
 
 ```python
+import codecs
+
 class SseDecoder:
     def __init__(self):
-        self.byte_buf = b""
+        self._utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.line_acc = ""
-        self.event, self.eid, self.data = "message", None, []
-        self.last_id = None
-    def _flush_event(self):
-        data = "\n".join(self.data)
-        ev = {"event": self.event, "id": self.eid if self.eid is not None else self.last_id, "data": data}
-        if self.eid:
-            self.last_id = self.eid
-        self.event, self.eid, self.data = "message", None, []
-        return ev
+        self.first = True
+        self.event, self.data = "", []
+        self.last_id = ""
+    def _dispatch(self):
+        data, event = self.data, self.event or "message"
+        self.event, self.data = "", []
+        if not data:
+            return None
+        return {"event": event, "id": self.last_id, "data": "\n".join(data)}
+    def _line(self, line, out):
+        if line == "":
+            ev = self._dispatch()
+            if ev is not None:
+                out.append(ev)
+            return
+        if line.startswith(":"):
+            return
+        name, _, val = line.partition(":")
+        if val.startswith(" "):
+            val = val[1:]
+        if name == "event":
+            self.event = val
+        elif name == "data":
+            self.data.append(val)
+        elif name == "id" and "\0" not in val:
+            self.last_id = val
     def feed(self, chunk: bytes):
-        self.byte_buf += chunk
-        n = _utf8_complete_len(self.byte_buf)
-        text = self.byte_buf[:n].decode("utf-8")
-        self.byte_buf = self.byte_buf[n:]
-        out, buf = [], self.line_acc + text.replace("\r\n", "\n").replace("\r", "\n")
-        parts = buf.split("\n")
-        self.line_acc = parts.pop()
-        for line in parts:
-            if line == "":
-                out.append(self._flush_event()); continue
-            if line.startswith(":"):
-                continue
-            name, _, val = line.partition(":")
-            val = val[1:] if val.startswith(" ") else val
-            if name == "event":
-                self.event = val
-            elif name == "data":
-                self.data.append(val)
-            elif name == "id":
-                self.eid = val
+        text = self._utf8.decode(chunk)
+        if self.first and text:
+            text = text.removeprefix("\ufeff")
+            self.first = False
+        buf = self.line_acc + text
+        out, start, i, n = [], 0, 0, len(buf)
+        while i < n:
+            c = buf[i]
+            if c == "\n" or c == "\r":
+                if c == "\r" and i + 1 == n:
+                    break
+                self._line(buf[start:i], out)
+                i += 2 if c == "\r" and buf[i + 1] == "\n" else 1
+                start = i
+            else:
+                i += 1
+        self.line_acc = buf[start:]
         return out
-
-def _utf8_complete_len(b):
-    i = len(b)
-    while i > 0 and (b[i-1] & 0xC0) == 0x80:
-        i -= 1
-    if i == 0:
-        return 0
-    lead, rest = b[i-1], len(b) - i
-    need = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
-    return len(b) if rest + 1 >= need else i - 1
 ```
 
-Tests feed raw bytes, not pre-decoded strings: ① `b"data: " + bytes.fromhex("e4")` on one `feed` must not emit U+FFFD; after `feed(bytes.fromhex("bda0") + b"\n\n")`, `data=="你"`; ② `b"data: {\n"` then `b"data: }\n\n"` — first call yields no event, second has `data` `{\n}`; ③ `data: [DONE]\n\n` ends the stream and is not `json.loads`’d; ④ `event: error\ndata: boom\n\n` has `event=="error"`.
+Tests feed raw bytes, not pre-decoded strings: ① `b"data: " + bytes.fromhex("e4")` on one `feed` must not emit U+FFFD; after `feed(bytes.fromhex("bda0") + b"\n\n")`, `data=="你"`; ② `b"data: {\n"` then `b"data: }\n\n"` — first call yields no event, second has `data` `{\n}`; ③ `data: [DONE]\n\n` ends the stream and is not `json.loads`’d; ④ `event: error\ndata: boom\n\n` has `event=="error"`; ⑤ `b"data: a\r"` then `b"\n\r\n"` — a CRLF split across chunks still yields exactly one event with `data=="a"`; ⑥ `b": ping\n\n"` and `b"event: x\n\n"` yield no event (empty data buffer is not dispatched); ⑦ `b"data:\n\n"` yields one event with `data==""`.
 
 **Follow-ups:** If `errors="replace"` is used by mistake, U+FFFD is already on screen—how does a test forbid that path; does a comment line `: keep-alive` flush; an empty `data:` field appends an empty string to the data buffer per spec (one extra newline after joining)—how do you avoid treating it as the event terminator.
 
@@ -1089,7 +1096,7 @@ Tests feed raw bytes, not pre-decoded strings: ① `b"data: " + bytes.fromhex("e
 - How do you property-test by cutting a valid SSE byte string at a random offset and asserting `feed` reconstitutes the same event sequence?
 - `[DONE]` in `event: message` data versus a comment line: what product difference, and should the decoder unify them into one ended callback?
 
-**Reasoning:** Chinese must survive arbitrary TCP cuts, and events must not be half-parsed. UTF-8 completeness and SSE blank-line framing are two different integrity layers. Wait for a code point at the byte layer, wait for a blank line at the text layer, and do not treat `[DONE]` or `error` as incremental JSON. Accept on the four byte fixtures, not on already-decoded strings as input.
+**Reasoning:** Chinese must survive arbitrary TCP cuts, and events must not be half-parsed. UTF-8 completeness and SSE blank-line framing are two different integrity layers. Wait for a code point at the byte layer, wait for a blank line at the text layer, and do not treat `[DONE]` or `error` as incremental JSON. Accept on the seven byte fixtures, not on already-decoded strings as input.
 
 ## CODE-032. An off-topic classifier must run on the incomplete hypothesis every N tokens without blowing TTFT. How do you run the small classifier in parallel with decode, and how do you decide when the score flips from “looks off-topic mid-way” back to on-topic after 120 tokens?
 
