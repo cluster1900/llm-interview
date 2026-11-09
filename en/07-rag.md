@@ -619,3 +619,47 @@
 - When citation accuracy and faithfulness disagree, which one gates a release?
 
 **Reasoning:** Map metrics to stages: recall/precision are retrieval; faithfulness/relevance are generation. High recall plus low faithfulness means the generator is speaking beyond the evidence. Add “answer only from context or abstain” and claim-level checks before you touch the retriever.
+
+## RAG-043. A handbook chapter is about 3k tokens; after cutting ~200-token chunks, “scope of this chapter” and pronoun referents disappear. The embedding model’s window is 8k. Can you encode the whole chapter once and pool token states over each chunk’s span to get chunk vectors? How does that differ from writing a generative prefix per chunk before embedding, and what must recall eval hold fixed?
+
+**Answer:** Yes. That is late chunking: run a long-context encoder once over the chapter, take the contextual token states, and mean-pool (or attention-pool) over each chunk’s character or token span to form the chunk vector stored in the ANN. The chunk vector has already “seen” the chapter-scope sentence and earlier entities, without copying those words into the chunk body. Generative prefixes are a different path: a generator writes a short self-contained preface for each chunk, then a short-window embedder encodes “prefix + body”; the chapter signal enters as someone else’s text, and the embedder itself never attends across chunks. Late chunking skips per-chunk generation, but needs an encoder window that covers the chapter (here 3k < 8k) and bills indexing compute per chapter, not per short chunk. Recall must compare three indexes on the **same** chunk boundaries—raw short chunks, generative prefixes, late-chunk pooling—and report Recall@k / nDCG on the same query set, not a public STS score for the encoder.
+
+**Deep dive:** Let the chapter tokens be t_1..t_L with L≈3000. The matrix H∈R^{L×d} is 0-based: row i is token t_{i+1}, matching the code. One long-window forward yields H. Chunk b covers the half-open span [i_b, j_b); v_b = mean(H[i_b:j_b]) (includes i_b, excludes j_b), then L2-normalize for the index. Queries still use the same encoder’s short query vector (or its query tower). Hard constraints:
+
+1. **Chunk boundaries and pooling spans must match.** Retrieval returns a chunk id; what you expand into the generator is still the original ~200-token span (or the parent block in a parent–child layout). If the pooled span disagrees with the expanded characters, a high recall score is grading the wrong evidence.
+2. **The window must cover the chapter.** At 3k < 8k, one forward is enough. If a chapter grows to 20k, split on headings into ≤window segments and late-chunk inside each; do not silently truncate the tail—truncation either muddies tail chunks with the head or drops them.
+3. **The cost ledger differs from generative prefixes.** Prefix path: one short generation per chunk (tens of tokens) plus one short-window embed; the embedder’s attention diameter stays at chunk length, and chapter facts exist only if the preface writes them down. Late-chunk path: one long forward per chapter, cheap pooling per chunk, zero generation. Prefixes cost generation quota and are human-readable; late chunking costs long-window compute and leaves no readable preface.
+4. **Do not confuse this with ColBERT-style late interaction.** The store is still one vector per chunk. Token-level MaxSim retrieval is a separate design. Nor is this “one vector for the whole chapter,” which would blur 200-token localization.
+
+Bake failure modes into eval. If “this chapter applies only to rack A” sits in the first 80 tokens, a mid-chapter ops chunk embedded in isolation often loses that constraint, so “can rack B follow these restart steps?” may false-hit; after late chunking the mid chunk’s mean still carries some head direction, so refusal or down-rank has a chance. Conversely, a query that only bites an error code unique to one chunk can lose a bit of contrast when chapter theme is averaged in—that trade is exactly what the paired compare must show, not a prior.
+
+Order-of-magnitude sketch (replace with your encoder’s wall times): raw short chunks ≈15 forwards of 200 tokens per chapter; late chunking is one 3k forward, often cheaper wall-clock than fifteen short ones, with peak activation growing in L. Generative prefixes add ~15 short generations. Incremental index updates recompute per chapter: one edited section reruns that chapter’s long forward and pooling only—do not rebuild the whole corpus daily just because you adopted late chunking.
+
+```python
+# H: [L, d] token states from one long forward over the chapter
+# spans: list of [start, end) token indices for each chunk
+import numpy as np
+
+def late_chunk_vectors(H, spans):
+    vecs = []
+    for i, j in spans:
+        v = H[i:j].mean(axis=0)
+        v = v / (np.linalg.norm(v) + 1e-12)
+        vecs.append(v)
+    return np.stack(vecs, axis=0)
+
+H = np.random.randn(12, 4).astype(np.float64)
+spans = [(0, 4), (4, 8), (8, 12)]
+V = late_chunk_vectors(H, spans)
+assert V.shape == (3, 4)
+assert np.allclose(np.linalg.norm(V, axis=1), 1.0)
+```
+
+**Follow-ups:** Chapter is 12k and the window is 8k—do you split on headings then late-chunk, or fall back to short chunks plus prefixes? If pooling switches from a mean to CLS or to the first chapter tokens, what happens to rack-constraint queries? If the query encoder cannot run long context and stays short-window only, may the document side still use the long window?
+
+**Extended questions:**
+- On the same 200-token boundaries, list forward counts and whether a generator is called for raw short chunks, generative prefixes, and late chunking.
+- Build 20 queries whose constraint sits in the chapter head and whose ops sit mid-chapter, and explain why a Recall@10 gap there decides the choice better than public STS.
+- If parents expand to the generator while children are late-chunk pooled, how do ANN ids and expanded text stay on the same span?
+
+**Reasoning:** The goal is chunk vectors that carry chapter-level constraints while keeping ~200-token locatable evidence. The constraints are the embedder window, indexing cost, and identical cut boundaries. Short-window embeds cannot attend across chunks; generative prefixes inject entities as bolted-on text; late chunking writes chapter context into chunk vectors with one long forward plus span pooling. Accept on Recall@k with cuts and queries frozen, and slice queries where the constraint is far from the ops sentence—not on generic sentence-pair scores.

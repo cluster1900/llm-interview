@@ -485,3 +485,51 @@ Task vectors are the same linear arithmetic: τ_domain = W_ft − W_0. If you al
 - Averaging several domain checkpoints (a soup) versus interpolating base↔one domain: which damps training noise and which damps domain displacement, and when do you chain them?
 
 **Reasoning:** The goal is to shrink an oversized domain step without retraining, so general skill stays above a floor and most domain gain remains. The constraint is that only existing checkpoints can move, and a linear mix needs per-parameter alignment plus basin connectivity. So write W_0 + α τ and pick α on the domain×general sweep; if the vocab is misaligned or the register has collapsed and walked off, declare failure instead of treating α=0.5 as a compromise. Accept on the two scores at the knee, not on whether the weights “look half-and-half.”
+
+## TRAIN-033. SFT runs on 8×A100 with instruction pairs whose median length is about 180 tokens, max length 2048, and a naive one-sample row that is about 70% pad. When you pack several (prompt, response) pairs into one row, how do you isolate causal attention per sample, why must position ids restart at 0, which tokens does the loss mask cover, what spurious conditional does naive concatenation teach, how do tokens/sec and steps/sec move, and what breaks when a single sample is already near 2048?
+
+**Answer:** Several samples may sit end to end in one row and still compute as independent short sequences. Attention is block-diagonal causal (a variable-length interface such as cu_seqlens): tokens in A may see only A, never B, and pad is not content. Position ids restart at 0 on every sample so the second sample does not enter RoPE at position 900. Vanilla RoPE inner products depend on position deltas, so a constant shift inside one sample preserves relatives; a live request still starts at 0, and YaRN, NTK, or a cos/sin table indexed by the absolute id all read that absolute index, so the training phase has to match inference. Loss sits only on response tokens, including the response's own end-of-turn id; prompt and pad labels are ignored. The first position of the next sample must be ignored too, or the usual "logits[i] versus labels[i+1]" shift trains A's last position to predict B's first token. Concatenate without isolation and the model fits P(response_B | sample_A + prompt_B). At inference sample_A is absent, so that conditional is false. About 70% pad means roughly 0.3×2048≈614 real tokens per row — that is the mean. A median row of 180 is actually 1−180/2048≈91% pad. After packing replaces pad with other real samples, fleet-average useful tokens can rise by about 3×. If the FFN already ran at width 2048, steps/sec stay about the same and the gain is useful tokens per step. A sample already near 2048 has almost no tail to fill, and packing does not extend a sample that is over 2048.
+
+**Deep dive:** Pin the boundary with two 180-token samples. A is prompt 100 + response 80. B is prompt 120 + response 60. The pack is 360; there is no need to pad the picture out to 2048.
+
+```text
+idx    0........99  100.....179  180.......299  300.....359
+piece  A prompt     A response   B prompt       B response
+pos    0........99  100.....179  0.........119  120.....179
+attn   |------- A causal -------|  |-------- B causal --------|
+label  ignore       A tokens     ignore         B tokens
+```
+
+```python
+ids = list(range(360))            # stand-in ids; only alignment matters
+labels = [-100] * 360
+labels[100:180] = ids[100:180]    # A response, including its end-of-turn id
+labels[300:360] = ids[300:360]    # B response
+pos = list(range(180)) + list(range(180))
+cu_seqlens = [0, 180, 360]        # block-diagonal causal, not one 360-triangle
+# logits[i] trains against labels[i + 1]
+assert labels[180] == -100        # position 179 does not predict B
+assert labels[100] == ids[100]    # position 99 predicts A's first response token
+assert pos[180] == 0 and pos[179] == 179
+```
+
+Three switches block three different bugs. A block-diagonal mask (or a document id: attend only if the doc ids match and the column is at or before the row) stops B's hidden state from reading A. Resetting position ids stops the RoPE phase from disagreeing with inference; it does not stop cross-sample attention, and neither does an EOS separator. The label stops the boundary cross-entropy: even with attention cut, if labels[180] is still B's first token, position 179 is trained to predict another sample. The opposite is also true: mask the loss and leave one lower triangle over the whole row, and B's response is predicted from a state that saw A, so the live conditional does not match. Instruction SFT leaves prompt tokens out of the loss by default. A few completion corpora intentionally supervise the prefix; that is a different data contract and needs its own mask, not this instruction mix.
+
+The spurious conditional is cheap to learn on short instructions. A's response mentions ticket 88421 and B asks for the refund window. Under one causal mask, B's answer positions can attend to 88421, and the model writes a neighbor-row entity into B's conditional. At inference B arrives alone, the entity is gone, and the generator may still invent an id it only ever saw next door. At a median of 180, a row holds many documents, the boundary count is close to the sample count, and most tokens sit near some boundary. Isolation is a correctness condition of packing, not an optional speedup. Long documents that occasionally touch during continued pretraining are a different scale; do not reuse that mask design for this SFT mix.
+
+Separate real tokens from optimizer steps. If the naive path pads each row to 2048 and still runs the FFN on pad positions, the step shape is already a full 2048 and about 70% of those FLOPs land on pad. Packing replaces those positions with real tokens. A fleet mean of about 614 real tokens against a packed fill near 95% (0.95×2048≈1946) is about 1946/614≈3.2× useful tokens. The median row is steeper: 180 tokens are 91% pad, 2048//180=11, 11×180=1980, fill 1980/2048≈96.7%, and that row's real tokens become 11×. Eleven is the short-row ceiling, not the fleet multiplier implied by 70% pad. The long tail raises the mean length, so the two multipliers are reported separately. On steps/sec: if FFN width is unchanged, step time is about the same, steps/sec barely move, and useful tokens/sec rise. If the old path already used a variable-length kernel and paid FFN only on real tokens, packing merges many short sequences into one 2048, the step gets heavier, steps/sec fall, and each step buys more response tokens. On 8×A100 the gradient all-reduce is paid per step and its bytes do not depend on pad, so the figure to watch is non-ignored response tokens per step, not steps/sec. The sample count per step rises by about the same factor. If the learning rate was tuned for the old sample count, do not also multiply gradient accumulation by a "packing factor" or the effective batch is scaled twice. The loss must be a mean over non-ignored response tokens. Treating ignores as zeros and averaging over the full 2048 changes the ignore rate when you pack, the loss scale jumps, and the same learning rate is suddenly large.
+
+The quadratic term needs a mask that actually cuts. Eleven length-180 samples cost 11×180²=356,400 under a block-diagonal mask. One lower triangle of 2048 is 2048²=4,194,304, about 12×, and the cross terms are exactly the spurious conditional. A variable-length interface keeps the square inside each sample. A dense mask of shape [batch, heads, 2048, 2048] can be correct and is a poor default on memory.
+
+Near 2048, packing degenerates to the original row. A 2000-token sample leaves 48 free positions, the next median-180 sample does not fit, and the only saving versus padding to 2048 is those 48 pad positions — fill is already 2000/2048≈97.7%. A sample over 2048 needs a written truncation rule (keep the labeled tail of the response; do not silently shave the end of the answer) or it is dropped. Concatenation does not grow the window. A packer that refuses to emit until 2048 is full will stall the batch on long samples; emit them as their own row. Greedy "append while it fits" leaves a hole smaller than the next sample, and the hole is pad again. Sort by length and first-fit, and monitor fill per row. One long sample sharing a row with shorts, without a cut mask, pays both 2048² attention and a polluted conditional on the shorts.
+
+Accept on two numbers: non-pad, non-ignored response tokens per second, and a leakage probe — an entity unique to A must not appear in greedy output when B is sent alone. Steps/sec falling while response tokens/sec rise can be a correct pack. Steps/sec rising with a failed probe is throughput bought with a false conditional.
+
+**Follow-ups:** If you reset position ids and do not cut attention, is the spurious conditional still there? If ignored labels count as zero and you average over the whole row, why does the learning rate look suddenly large after packing? With a 2000-token sample and a following 180-token sample, do you force them into one row, drop the 180, or leave the 180 for the next row?
+
+**Extended questions:**
+- For two toy samples of 4 tokens each, write labels and position_ids and mark the index that most easily trains A to predict B.
+- How many median-180 samples fit in one row, and why is the useful-token multiplier at a fleet pad rate of about 70% a different number?
+- When a single sample exceeds 2048, which constraint does packing, truncation, or raising max length hit first?
+
+**Reasoning:** The goal is a width-2048 GEMM spent on real response tokens, a conditional that is still "this prompt, this response," and a position phase that matches a live request starting at 0. Block-diagonal causal attention, position ids restarted per sample, and loss only on response tokens (including the end-of-turn id) are three separate switches. Fill rate sets useful tokens/sec. Whether steps/sec fall depends on whether pad used to participate in the FFN. A sample that already fills 2048 gets nothing from packing. Accept on response tokens per second and a cross-sample leakage probe, not on optimizer steps per second.

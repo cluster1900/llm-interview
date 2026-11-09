@@ -24,18 +24,18 @@ Each question is organized in five layers:
 
 | # | 代码 Code | 中文 | English | 题数 Count |
 |---:|---|---|---|---:|
-| 01 | `ARCH` | [模型原理：Transformer 与语言模型](zh/01-model-internals.md) | [Model Internals: Transformers and Language Models](en/01-model-internals.md) | 45 |
+| 01 | `ARCH` | [模型原理：Transformer 与语言模型](zh/01-model-internals.md) | [Model Internals: Transformers and Language Models](en/01-model-internals.md) | 46 |
 | 02 | `GEN` | [生成、解码与长上下文](zh/02-decoding-context.md) | [Decoding, Context and Long Context](en/02-decoding-context.md) | 28 |
-| 03 | `TRAIN` | [预训练、微调与分布式训练](zh/03-training-adaptation.md) | [Pre-training, Fine-tuning and Distributed Training](en/03-training-adaptation.md) | 32 |
-| 04 | `ALIGN` | [对齐、后训练与推理模型](zh/04-alignment-post-training.md) | [Alignment, Post-training and Reasoning Models](en/04-alignment-post-training.md) | 24 |
+| 03 | `TRAIN` | [预训练、微调与分布式训练](zh/03-training-adaptation.md) | [Pre-training, Fine-tuning and Distributed Training](en/03-training-adaptation.md) | 33 |
+| 04 | `ALIGN` | [对齐、后训练与推理模型](zh/04-alignment-post-training.md) | [Alignment, Post-training and Reasoning Models](en/04-alignment-post-training.md) | 25 |
 | 05 | `PROMPT` | [提示与上下文工程](zh/05-prompt-context-engineering.md) | [Prompting and Context Engineering](en/05-prompt-context-engineering.md) | 30 |
 | 06 | `EMB` | [Embedding 与向量检索](zh/06-embeddings-vector-search.md) | [Embeddings and Vector Search](en/06-embeddings-vector-search.md) | 28 |
-| 07 | `RAG` | [检索增强生成](zh/07-rag.md) | [Retrieval-Augmented Generation](en/07-rag.md) | 42 |
+| 07 | `RAG` | [检索增强生成](zh/07-rag.md) | [Retrieval-Augmented Generation](en/07-rag.md) | 43 |
 | 08 | `AGENT` | [Agent、工具调用与 MCP](zh/08-agents-tools-mcp.md) | [Agents, Tool Use and MCP](en/08-agents-tools-mcp.md) | 57 |
 | 09 | `MM` | [多模态与语音](zh/09-multimodal-voice.md) | [Multimodal AI and Voice](en/09-multimodal-voice.md) | 35 |
 | 10 | `SERVE` | [推理优化与模型服务](zh/10-inference-serving.md) | [Inference Optimization and Serving](en/10-inference-serving.md) | 61 |
 | 11 | `OPS` | [LLMOps 与生产可靠性](zh/11-llmops-reliability.md) | [LLMOps and Production Reliability](en/11-llmops-reliability.md) | 40 |
-| 12 | `EVAL` | [评估与测试](zh/12-evaluation.md) | [Evaluation and Testing](en/12-evaluation.md) | 41 |
+| 12 | `EVAL` | [评估与测试](zh/12-evaluation.md) | [Evaluation and Testing](en/12-evaluation.md) | 42 |
 | 13 | `SAFE` | [安全、隐私与治理](zh/13-safety-privacy-governance.md) | [Safety, Privacy and Governance](en/13-safety-privacy-governance.md) | 53 |
 | 14 | `DESIGN` | [系统设计案例](zh/14-system-design-cases.md) | [System Design Cases](en/14-system-design-cases.md) | 43 |
 | 15 | `CODE` | [手写实现](zh/15-hands-on.md) | [Hands-on Implementation](en/15-hands-on.md) | 32 |
