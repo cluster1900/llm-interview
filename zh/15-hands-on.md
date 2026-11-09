@@ -231,20 +231,43 @@ def typical_filter(logits, temperature=0.8, mass=0.9, tau=None):
 
 **推理回答：** 目标是实现按熵对齐的典型性过滤，并预见到结构化输出先坏。约束是每步还要多维护 `H` 与 `|I−H|`，尖峰和长尾会被同一尺子切错。所以统计量写进逐步日志，JSON/闲聊/代码用不同类型的金样看谁先裂，而不是看平均流畅度。
 
-## CODE-008. 已经 prefill、接着 decode 的路径，和完整 prompt 一次跑完的前向，同一前缀上 logits 彼此不合。排查时你优先核对接在哪一维、掩码是否按绝对下标绘制，还是 Q 被错误写进 cache？
+## CODE-008. 要在解码循环里手写 top-p（nucleus）：给定一步的 logits、`p=0.9`、温度 T。排序之后累计质量时，越过阈值的那一个 token 要不要留下？T 为 0、两个 token 概率并列、softmax 前 logits 差到上百，这些边界你怎么处理，单测各断言什么？
 
-**答：** 只缓存 K、V：历史 Q 不再参与后续步，每步只用新 token 的 Q。先核对拼接是否沿序列维（常见形状 `(B, H, S, Dh)` 的 dim=2），以及掩码是否按绝对位置 `S-T+i` 绘制。逐步 decode 时 `T=1`，新 token 看得到全部已缓存 key，掩码应全开；若仍套训练时的 `T×T` 上三角，会错切或直接报形状错误。对不齐时优先做「关 cache 的全量重算 vs 开 cache」逐 token 对比，不要先去调温度或学习率。
+**答：** 先按温度做数值稳定的 softmax，再按概率降序（并列时用 token id 升序打破）取最短前缀，使累计质量 ≥ p，**包含**那个刚好让累计越过 p 的 token，然后只在这个核上重新归一化再抽样。T≤0 不走核，直接 argmax（并列取 id 更小的）。softmax 前减去 max(logits)，避免 exp 溢出成 inf。p≤0 退化成只留第一名；p≥1 留全部。单测用小词表把这几条写成确定性断言，不要靠「看起来多样」。
 
-**深入展开：** Prefill 吃 `(B, S, D)`，写出该层全部 K、V。Decode 吃 `(B, 1, D)`，算出这一步的 q、k、v，把 k、v 接到 cache 末尾，用 `q_len=1` 对 `k_len=S+t` 做点积，分数是 `(B, H, 1, S+t)` 而不是方阵。`torch.cat` 每步复制整段 cache，长序列上多出 `O(S)` 带宽；生产应预分配到最大长度或按页追加。示意体积：32 层、32 头、`Dh=128`、S=4096、B=8、fp16 约 `2×32×32×128×4096×8×2 ≈ 16GB`。正确性约定：贪心或固定种子时，增量路径每个位置的 logits 应与一次前向的对应行在 dtype 误差内重合。RoPE 要先约定缓存旋转后的 K，还是缓存未旋转的 K 并在点积前按绝对位置再旋——两条路径不能混用。
+**深入展开：** 核的定义是「最小的高概率集合，使其质量至少为 p」，所以切点在 `cumsum[k-1] < p ≤ cumsum[k]` 时必须留下下标 k 那个 token；若实现写成 `cumsum < p` 再切片，尖峰步会把唯一合法词丢掉。温度：`z = (logits - logits.max()) / T`，T 只改变尖锐度，不改变排序；T→0 时核会收成 1，与 greedy 重合，直接短路更稳，也避开 0 除。并列：稳定键 `(prob desc, id asc)`，因为 numpy 默认的 quicksort 不稳定，不保证并列时按 id 排。数值：未减 max 时，logit=1000 的 exp 在 float64 里会溢出成 inf（float32 在约 89 就溢出）；减 max 后最大项的 exp 为 1，核质量可加。实现里 `searchsorted(cumsum, p, side="left") + 1` 就是「包含越过点」。示意词表 5 个 token 即可覆盖测试，不必上真实 10 万词表。
 
-**后续追问：** 一个 batch 里各序列长度不同，cache 与掩码怎么对齐；反复 `cat` 比预分配慢在哪一次拷贝；加上滑动窗口后，过期的 KV 从哪一端删。
+```python
+import numpy as np
+
+def nucleus_sample(logits, p=0.9, temperature=1.0, rng=None):
+    logits = np.asarray(logits, dtype=np.float64)
+    n = logits.size
+    if n == 0:
+        raise ValueError("empty logits")
+    if temperature <= 0 or p <= 0:
+        return int(np.flatnonzero(logits == logits.max())[0])
+    z = (logits - logits.max()) / temperature
+    prob = np.exp(z); prob /= prob.sum()
+    order = np.lexsort((np.arange(n), -prob))  # prob desc, id asc
+    csum = np.cumsum(prob[order])
+    cut = n if p >= 1 else int(np.searchsorted(csum, min(p, 1.0), side="left")) + 1
+    keep = order[:cut]
+    renormal = prob[keep]; renormal /= renormal.sum()
+    rng = np.random.default_rng(rng)
+    return int(rng.choice(keep, p=renormal))
+```
+
+单测（温度 0 与并列不依赖 rng）：①logits=`[0, 10, 0]`，T=0 → 下标 1；②`[5, 5, 0]`，T=0 → 下标 0（id 更小）；③概率 `[0.6, 0.25, 0.15]`，p=0.8 的核必须是前两个（0.6+0.25=0.85 才越线），不得只留 0.6；④logits=`[1000., 0., 0.]` 不得出现 inf/NaN，核大小为 1。
+
+**后续追问：** p=0.9 但第一名已经 0.95，核大小是 1 还是仍再塞一个垫底；`lexsort` 和 `argsort(-prob)` 在三连并列时核成员差在哪；核采样之后还要不要再叠 top-k 做安全帽，k 小于核大小时谁优先。
 
 **扩展问题：**
-- 用户中途改了系统提示，哪些层的 cache 必须整段作废？
-- 连续批处理里一条序列先结束，它的 KV 页怎样归还，才不踩到还在 decode 的序列？
-- cache 量化到 INT8 后，你用什么对齐指标判断和 fp16 路径「足够等价」？
+- 把「包含越过阈值的 token」和「严格 cumsum<p」两种切法，在 p_max=0.95 的尖峰步上各画出核，哪一种会空核。
+- 如何用固定种子断言：同一 logits 连续 100 次采样只落在核内，从不落到被切掉的尾巴。
+- T=1、p=1 时函数应等价于对 softmax 直接 multinomial，你用哪条统计检验防止偷偷还在截断？
 
-**推理回答：** 数学上 decode 应等于只取全量前向的最后一个位置，因此可缓存的是不随未来 query 变化的 K、V，掩码必须用绝对下标。用开关 cache 的 logits 对齐验收正确性，再用「每步注意力从 O(S²) 降到 O(S)」验收性能。
+**推理回答：** 目标是实现带边界的 nucleus，而不是复述「按质量截」。约束是越过点必须留下、T=0 与并列要决定性、exp 要稳定。用最短前缀含越线 token、argmax 短路、减 max 的 softmax。验收看四条小词表断言全绿，而不是看生成散文好不好读。
 
 ## CODE-009. 样例正文恰好含 {{nickname}}，系统段和 few-shot 共用一份 Jinja。如何把真正该换掉的槽位与例子里那些字面的大括号分开，并用单测保证转义之后的例子不会把 ChatML 的角色分隔头拆开？
 
@@ -363,20 +386,80 @@ def cite_ok(claimed, src_tag):
 
 **推理回答：** 目标是数字可以检索，但不能被改口成另一种会计基础。约束是版面已净、数字本身无标签。所以用标题/表题打封闭枚举，引用检查看（声称基础 × 源标签）。验收用 non-GAAP 数字引成正式营收必红。
 
-## CODE-012. 检索后生成的问答必须周一交付，材料是大约三千篇内部 Wiki 的 Markdown。写入库、做检索、拼 prompt，函数边界你会怎么切？空结果为何必须在请求模型前就中止？
+## CODE-012. 知识库约有 800 篇 Markdown 手册，要手写按标题层级切块的函数：`#`–`######` 切出块并带上标题路径（如 `鉴权 > 超时`），但围栏代码、GFM 表格和连续列表不得从内部切断。目标块大约 200–800 字符（示意）。你会怎样扫行维护状态机，边界用例和单测怎么写？
 
-**答：** 入库写成 `load → clean → chunk → embed → upsert`：读文件、去掉导航和页脚、按标题切块、批量算向量、连同 `doc_id / heading_path / char_span / version` 写入向量表。查询写成 `embed_query → retrieve(top_k, filter) → build_prompt → generate`：只把带 citation id 的块塞进上下文。检索结果为空、或最高分低于你标定的阈值时，直接返回「手册里没有依据」，不要把空上下文交给模型「尽量答」——参数记忆会补出过期甚至从未写过的制度。
+**答：** 按行扫描，维护三块状态：标题栈、是否在围栏内、当前块缓冲。碰到新标题且不在围栏里才 flush 上一块并更新路径；围栏以行首三个反引号或三个波浪号开关，围栏内的 `#`、`|`、`- ` 一律当正文。表格是连续的 `|` 行（可含分隔行），列表是连续的无序/有序列表行——这两种在 flush 时要么整段留下，要么整段跟下一块，禁止在表行或列表项中间切开。块对象带 `heading_path`、起止行号和原文切片。
 
-**深入展开：** 每条记录至少有 `chunk_id、text、vector、source_path、heading_path、start、end、acl、doc_version`。清洗要丢掉侧边栏和「上一篇/下一篇」，否则近邻会变成站点模板。切块常见目标大约 200–800 token、重叠约 10%–20%，并保留标题路径，避免「权限」标题和下面的参数表被切开。嵌入必须和查询用同一模型、同一预处理；换模型等于换坐标系，必须全量重嵌。检索侧先做权限和版本过滤再取 top-k（例如 4–8 块），不要先全球 top-k 再丢。组 prompt 时块以 `[c12]` 这种稳定 id 出现，生成后再核对引用是否都在本轮检索集里，对不上就剥句。空检索闸门放在 `build_prompt` 之前：`k==0` 或 `max_score < τ`（τ 按所用嵌入模型在标注集上标定，例如先看分位而不是套一个万能小数）。最小可用版也要有这条拒答，以及「问题指向已删章节」的负例。评估把检索召回和生成忠实度分开记，不要只看答案是否通顺。
+**深入展开：** 状态机的关键不是「按字符数硬切」，而是「只在安全边界切」。安全边界：空行后的段落起点、标题行、围栏开关行的外侧。不安全：围栏内、表的中间行、同一列表的中间项。超长围栏（示意超过 800 字符的示例代码）整块保留并打 `oversized=True`，让检索侧决定要不要再按语言切——切块器不得在开启围栏行和闭合围栏行之间插入切点。标题栈按级别弹出：遇到 `##` 就弹掉更深的 `###`，路径用 ` > ` 拼接，前言（第一个标题之前）路径为空列表。不要在切块器里做 HTML 注释剥离或嵌入，那是入库清洗的责任——这里只保证结构单元完整。
 
-**后续追问：** 同一文档周五改了一节，增量 upsert 和按旧 `doc_version` 批量作废谁先谁后；最高分只略过阈值但块明显答非所问，你调 τ、加关键词倒排，还是加轻量重排；引用 id 被模型编造时，是剥句、整段拒答，还是再查一次。
+```python
+import re
+ATX = re.compile(r"^(#{1,6})\s+(.*)$")
+BT = chr(96) * 3
+FENCE = re.compile("^(" + re.escape(BT) + "|~~~)")
+TABLE = re.compile(r"^\s*\|")
+LIST = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+def chunk_markdown(src, max_chars=800):
+    lines = src.splitlines(keepends=True)
+    path, buf, start, fence, out = [], [], 0, None, []
+    def flush(end):
+        text = "".join(buf)
+        if text.strip():
+            out.append({"heading_path": tuple(path), "start": start, "end": end, "text": text})
+        buf.clear()
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if fence:
+            buf.append(ln)
+            if ln.startswith(fence):
+                fence = None
+            i += 1
+            continue
+        fm = FENCE.match(ln)
+        if fm:
+            if buf and sum(map(len, buf)) >= max_chars:
+                flush(i)
+                start = i
+            fence = fm.group(1)
+            buf.append(ln); i += 1
+            continue
+        hm = ATX.match(ln)
+        if hm:
+            flush(i)
+            level, title = len(hm.group(1)), hm.group(2).strip()
+            path[:] = path[: level - 1] + [title]
+            start = i; buf.append(ln); i += 1
+            continue
+        if TABLE.match(ln) or LIST.match(ln):
+            kind = TABLE if TABLE.match(ln) else LIST
+            j = i
+            while j < len(lines) and (kind.match(lines[j]) or (kind is TABLE and re.match(r"^\s*\|?\s*[-:| ]+\s*$", lines[j]))):
+                j += 1
+            block = lines[i:j]
+            if buf and sum(map(len, buf)) + sum(map(len, block)) > max_chars:
+                flush(i); start = i
+            buf.extend(block); i = j
+            continue
+        buf.append(ln)
+        if ln.strip() == "" and sum(map(len, buf)) >= max_chars:
+            flush(i + 1); start = i + 1
+        i += 1
+    flush(len(lines))
+    return out
+```
+
+单测至少四条：①围栏内有一行 `# 不是标题`，切完后该围栏仍是同一块，路径仍是围栏外那个节；②三行表不得被切成「表头一块、数据行一块」；③`- a` / `  - nested` 连续列表同块；④无标题前言路径为 `()`。超长代码块断言 `end-start` 覆盖整个围栏。
+
+**后续追问：** Setext 标题（下划线 `===`）要不要支持，不支持时文档会怎样被切错；围栏 info string 标明 markdown、内部正文又出现三个反引号时，你怎样避免提前闭合；一块只有标题没有正文，是丢弃、是保留空块，还是并入下一节。
 
 **扩展问题：**
-- 三千篇里混着过期草稿和现行制度，入库主键怎样带版本，才能避免模型引用上周的鉴权章节？
-- 查询只是「那个超时怎么配」，没有文档名，你在检索前要不要做指代补全，补全错了如何回退到原句？
-- 怎样构造「手册未记载」的问题集，证明空检索闸门真的在模型调用前触发，而不是生成后再后悔？
+- 怎样构造「列表项里嵌一行看起来像表」的夹具，证明列表优先于表，或反过来并写清理由？
+- `heading_path` 做成元组有什么测试上的好处，做成可变列表会在哪条单测里脏掉？
+- 切点只允许落在空行时，超长无空行的段落你是硬切、报 oversized，还是按句号再找一次安全点？
 
-**推理回答：** 目标是周一能答现行手册并带引用，约束是空证据不得编造、权限和版本必须在检索阶段生效。所以把链路拆成可测的入库与查询函数，元数据跟向量一起走，拒答闸门放在组 prompt 之前。验收看现行章节召回、已删章节引用为零，以及空检索路径的模型调用次数为零。
+**推理回答：** 目标是块对齐阅读单位：节、代码、表、列表，并带上路径。约束是字符预算不能破坏这些单元。所以用行级状态机，只在标题、围栏外侧和段落后 flush。验收看四条结构夹具，而不是平均块长落在 500。
 
 ## CODE-013. 工单库里约有八千条记录，每天夜里新增 5% 左右，向量模型一直没换。如何只把新行追加进去、对已删记录打墓碑，从而避免全库重嵌？又怎样用单测确认第二天无论取多少 k 都召不回已删 id？
 
@@ -579,33 +662,59 @@ def replay(events, t_ms):
 
 **推理回答：** 目标是任意时刻的屏幕可重建、可对证。约束是办结 JSON 丢掉时间线和未提交的可见字节。所以把 delta/取消/超时/校验收成带时间与序号的事件，回放做成纯折叠，并用半截金额金样证明最终快照不够。
 
-## CODE-019. 模型服务商会冷不丁砸来 429；离线要把五万张工单都标上标签，每一次请求大约耗时 3 秒。并发如何限制、退避如何加抖动、单条失败如何隔离？上限钉死在 32 时墙钟大概要花多久？429 连成片时怎样把节奏压下来？
+## CODE-019. 五万条工单的离线标注跑到大约 52% 时进程被 OOM killer 杀掉。结果写在 `labels.jsonl`，每行 `{ticket_id, label, model, prompt_hash}`。怎样做断点续跑，使重跑既不丢已成功的 2.6 万条、也不对同一 id 写两行，又如何在收工时校验去重与 schema？不要把 429 退避当成本题主线。
 
-**答：** 用信号量把同时飞行的请求钉在上限（例如 32）；只对 429、5xx、超时做指数退避，睡眠取 `U(0, min(cap, base·2^attempt))` 这种全抖动，避免所有协程在同一时刻重试；单条最终失败则记录错误并继续，不让异常取消整个批次。墙钟近似 `N × 延迟 / 并发`：50000 × 3s / 32 ≈ 4700s，大约 1.3 小时（不含重试和限流）。429 连片时按最近窗口的 429 比例下调并发，并遵守 Retry-After。
+**答：** 成功写入必须对 `ticket_id` 幂等：先写临时文件再 `fsync`+原子改名，或用带主键的库 `INSERT … ON CONFLICT DO NOTHING`。进度游标与结果要能互相核验——只记「跑到第 26000 行」不够，因为杀进程可能发生在「模型已返回、磁盘未落稳」之间。续跑时先扫描已提交结果建成 `done` 集合，输入流跳过这些 id，失败行进死信文件可单独重放。收工校验：行数、唯一 `ticket_id` 数、主键冲突数为 0，每行过 schema，抽若干条对照输入清单。
 
-**深入展开：** 五万个协程一次性创建通常内存还能扛，更稳的是有界队列加固定数量的 worker，从源头背压。错误要分类：400 或鉴权失败直接落盘，不要重试。按文档 id 把成功结果持久化，重跑跳过已成功项，避免重复计费。无抖动的 `base·2^n` 会在第 n 秒对齐成重试风暴，比原来的 429 更伤。自适应并发可用「连续成功则缓增、一有 429 就腰斩」。还要叠客户端按 token 的限流，避免本地并发已降、TPM 仍然超标。若供应商提供离线批接口，重试和计价通常更适合这种任务，同步在线接口留给交互。
+**深入展开：** 杀进程的窗口有三种脏状态：①模型已计费但本地无行——续跑会再花一次钱，所以结果键必须是 `ticket_id`，接受「宁可重复计费一次、也不丢标签」，并用供应商侧若有的幂等键降低双计费；②磁盘上有半行 JSON——读取时丢掉无法解析的最后一行，当作未完成；③游标超前于文件——以文件为准重建 `done`，游标只是加速。推荐布局：`results.jsonl` 只追加完整行（写 `os.write` 整行含 `\n` 后 `f.flush(); os.fsync(f.fileno())`），`deadletter.jsonl` 记最终失败，`done` 在启动时从两份文件加载。不要在信号处理器里做复杂 I/O；注册 `SIGTERM` 只设 `stop` 标志，worker 在两条之间退出，让最后一次 fsync 的行成为边界。去重：同一 id 若因并发 worker 写了两行，收工扫描保留第一条合法 schema、其余进冲突报告，禁止静默各留各的标签。校验器是纯函数，CI 和收工脚本共用。
 
 ```python
-sem = asyncio.Semaphore(32)
-async def one(doc):
-    async with sem:
-        for attempt in range(max_retries + 1):
+import json, os
+
+def load_done(path):
+    done = {}
+    with open(path, "a+", encoding="utf-8") as f:
+        f.seek(0)
+        raw = f.read()
+        if raw and not raw.endswith("\n"):
+            raw = raw.rsplit("\n", 1)[0] + "\n"
+        for line in raw.splitlines():
             try:
-                return await call_llm(doc)
-            except Retryable as e:
-                if attempt == max_retries:
-                    return Failed(doc.id, e)
-                await asyncio.sleep(random.uniform(0, min(30.0, 0.5 * 2 ** attempt)))
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tid = row.get("ticket_id")
+            if tid is not None and tid not in done:
+                done[tid] = row
+    return done
+
+def append_row(path, row):
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with open(path, "ab") as out:
+        out.write(line.encode("utf-8"))
+        out.flush(); os.fsync(out.fileno())
+
+def validate(results, expected_ids):
+    ids = [r["ticket_id"] for r in results]
+    return {
+        "n": len(ids),
+        "unique": len(set(ids)),
+        "dupes": len(ids) - len(set(ids)),
+        "missing": sorted(set(expected_ids) - set(ids)),
+        "schema_ok": all({"ticket_id", "label", "model", "prompt_hash"} <= r.keys() for r in results),
+    }
 ```
 
-**后续追问：** 信号量和「固定 worker + 队列」在取消、背压和内存上差在哪里；任务跑到约 80% 进程被杀，怎样从落盘状态续跑且不重复计费；Retry-After=30s 时还要不要再叠一层自己的抖动。
+单测：写 N-1 行完整 JSON + 半行，`load_done` 不得抛、半行 id 不在 `done`；同一 id 追加两次，`validate` 的 `dupes==1`；续跑迭代器对已在 `done` 的 id 零次调用模型（用假客户端计数）。
+
+**后续追问：** 结果要按租户分片文件时，游标和 `done` 集合怎样避免跨片丢 id；标签是枚举，收工发现 3% 行的 label 不在枚举里，你整批作废还是只重放这些 id；输入清单在中途被业务追加了 2000 条，续跑怎样发现新 id 而不重跑旧的。
 
 **扩展问题：**
-- 失败里约 30% 是上下文超长，重试没有意义，入队前应做哪一步预检？
-- 同一文档被两个 worker 重叠重跑时，怎样保证只成功写入一次？
-- 平均 3s、P95 约 12s 时，只用平均值估的 1.3 小时会怎样偏短，队列模型怎么改？
+- 比较「jsonl 追加 + 启动扫描」和「sqlite 主键」，崩溃窗口和并发 worker 下谁更容易保证恰好一行。
+- 怎样用假的 SIGTERM 在「call 返回之后、fsync 之前」注入一次崩溃，证明半行会被当成未完成？
+- 收工报告里 `unique` 等于输入清单，但仍可能标签全是同一个默认值——还缺哪条业务校验？
 
-**推理回答：** 约束是别打爆供应商、别因一条坏文档停整批、墙钟可预期。由这三条选择信号量、全抖动退避和逐条捕获。用可重试分类、断点 id 和 429 比例三条一起验收，而不是只看最终成功率。
+**推理回答：** 目标是杀进程后从已提交结果继续，且每个工单至多一行合法标签。约束是计费可能已发生、磁盘可能停在半行。所以以结果文件为权威 `done` 集，整行 fsync，收工做唯一性与 schema 校验。验收看半行夹具、重复 id 报告和续跑零次重复调用。
 
 ## CODE-020. 容量有限，过期条目不能一直占着。对模型本身、采样设置以及消息列表都相同的请求，网关要 O(1) 地 get/put 命中。哈希表该配上哪一种链表？至于惰性 TTL 与 LRU 这两套淘汰，谁先跑？
 
@@ -917,41 +1026,70 @@ def misbind(answer, chunks):
 
 **推理回答：** 目标是抓住跨实体漂属性，而不是再做一遍句子忠实度。约束是 NLI 看见数字存在就可能放行。所以两侧都抽三元组、按 sku 等值连接，日志记下外来实体和块号。验收用「两只真实 SKU、天数对调」必红。
 
-## CODE-031. 闸门不打 1–5 分，只看 SKU 与退货窗口写没写对；两份做摘要的 prompt 比的是忠实度。槽位对齐检查怎样做成一道确定性 CI？失败样本为何只交给 LLM 写给人看的说明？哪些合理的改写会被这道门禁误伤？
+## CODE-031. 浏览器客户端自己解析模型的 SSE 字节流：TCP 把 UTF-8 汉字「你」（`E4 BD A0`）切在 `E4` 与 `BD A0` 之间，下一个 chunk 才到；事件的 `data:` 行和结尾空行也不在同一包；流可能以 `data: [DONE]` 结束，也可能先来 `event: error`。解码器怎样写、怎样测，才不会把汉字打成 U+FFFD，也不会把半个事件当成完整 JSON？
 
-**答：** 从源工单抽出规范槽位（货号集合、退货天数的整数），对模型摘要再抽一遍，用相等或「源 ⊆ 摘要且无外来货号/天数」做布尔门。CI 只认检查器的通过/失败，不认任何评分模型的均值。LLM 只在失败样本上写人读得懂的说明，它的句子不得改写门禁结果。合法改写会误杀：把「30 天」写成「一个月」、「SKU-4412」写成「货号 4412」、「14 日」写成「两周」——槽位抽取器若只认一种表面形式，正确摘要会被红。
+**答：** 解码器分两层缓冲：字节层只 `decode` 到最后一个完整码点，残余字节留到下一块；文本层按 SSE 组帧，只有碰到空行才 flush 一个事件。`event` 默认 `message`，多条 `data:` 用 `\n` 拼；`data: [DONE]`（可带或不带空格）是正常结束，不是一条要 `json.loads` 的增量；`event: error` 走错误回调，随后结束，不要再等 `[DONE]`。禁止对每个 TCP chunk 做 `bytes.decode("utf-8", "replace")`，那正是出现乱码的原因。
 
-**深入展开：** 检查器是纯函数：`slots(src) → {skus: set[str], return_days: set[int]}`，摘要侧同样。通过条件示例：`sum_skus == src_skus`（或允许摘要少提未问到的货号，但不许多提），`return_days` 必须与源一致且不得出现第二个天数。实现用正则 + 一张很小的别名表（`sku/货号/style` → 货号；`天/日/days` → 日），不要在门禁里做蕴含推理。数量级：200 条冻结工单、每条毫秒级，适合每次改 prompt 都跑；失败再抽大约 10–20 条给 LLM 写「摘要写成了 90，源是 30」这类解释，解释进报告，不进 `exit code`。误杀清单要单独做金样：数字汉字、单位换算、货号分隔符、省略「SKU-」前缀。漏杀清单：源 30 天、摘要 30 天但货号换成了另一只真实 SKU——这必须红，且是检查器的主价值。不要用词重叠率当第二门，它会放行改错的天数。
+**深入展开：** 服务端就算按码点冲刷，中间代理仍可能按任意长度切 TCP。客户端因此不能假设「一块 = 一个事件」或「一块 = 合法 UTF-8」。状态：`byte_buf`、`line_acc`、当前事件的 `event/id/data_parts`。`feed(chunk)`：`byte_buf += chunk`，用 `decode("utf-8")` 的增量接口或自写「合法前缀」切出 `text`，非法续列等待而不是替换。`text` 按 `\n`（兼容 `\r\n`）切行，最后半行留在 `line_acc`。空行：组装 `{"event", "id", "data"}` 后清当前事件字段；`id` 若本事件未出现则继承上一个（SSE 默认），本题若只有单路补全可以忽略 id。`[DONE]` 比较应在 `data.strip()` 上做，避免 `data: [DONE]\n` 带空白漏匹配。错误事件的 `data` 可以是 JSON 对象或纯文本，解码器只负责递出，不在这里做业务重试。不要和多路复用那题搅在一起：这里假设一路，专攻字节边界与组帧。
 
 ```python
-import re
-SKU = re.compile(r"(?:SKU[- ]?|货号\s*)(\d{3,})", re.I)
-DAY = re.compile(r"(\d{1,3})\s*(?:天|日|days?)", re.I)
-ALIAS_DAYS = {"一个月": 30, "两周": 14, "一周": 7}
+class SseDecoder:
+    def __init__(self):
+        self.byte_buf = b""
+        self.line_acc = ""
+        self.event, self.eid, self.data = "message", None, []
+        self.last_id = None
+    def _flush_event(self):
+        data = "\n".join(self.data)
+        ev = {"event": self.event, "id": self.eid if self.eid is not None else self.last_id, "data": data}
+        if self.eid:
+            self.last_id = self.eid
+        self.event, self.eid, self.data = "message", None, []
+        return ev
+    def feed(self, chunk: bytes):
+        self.byte_buf += chunk
+        n = _utf8_complete_len(self.byte_buf)
+        text = self.byte_buf[:n].decode("utf-8")
+        self.byte_buf = self.byte_buf[n:]
+        out, buf = [], self.line_acc + text.replace("\r\n", "\n").replace("\r", "\n")
+        parts = buf.split("\n")
+        self.line_acc = parts.pop()
+        for line in parts:
+            if line == "":
+                out.append(self._flush_event()); continue
+            if line.startswith(":"):
+                continue
+            name, _, val = line.partition(":")
+            val = val[1:] if val.startswith(" ") else val
+            if name == "event":
+                self.event = val
+            elif name == "data":
+                self.data.append(val)
+            elif name == "id":
+                self.eid = val
+        return out
 
-def slots(text):
-    days = {int(n) for n, _ in DAY.findall(text)}
-    for phrase, n in ALIAS_DAYS.items():
-        if phrase in text:
-            days.add(n)
-    return {s.lstrip("0") or "0" for s in SKU.findall(text)}, days
-
-def faithful(src, summary):
-    s_sku, s_day = slots(src)
-    o_sku, o_day = slots(summary)
-    return o_sku <= s_sku and o_sku and s_day == o_day
+def _utf8_complete_len(b):
+    i = len(b)
+    while i > 0 and (b[i-1] & 0xC0) == 0x80:
+        i -= 1
+    if i == 0:
+        return 0
+    lead, rest = b[i-1], len(b) - i
+    need = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+    return len(b) if rest + 1 >= need else i - 1
 ```
 
-CI：对两个 prompt 各跑冻结集，比较 `faithful` 通过率；LLM 只 `explain(src, summary, slots)`。
+单测用字节夹具，不要先 `.decode()` 再喂：①`b"data: " + bytes.fromhex("e4")` 一次 `feed` 不得产出 U+FFFD，再 `feed(bytes.fromhex("bda0") + b"\n\n")` 后 `data=="你"`；②`b"data: {\n"` 与 `b"data: }\n\n"` 两次 feed，第一次事件列表为空，第二次 `data` 为 `{\n}`；③`data: [DONE]\n\n` 标记结束且不要 `json.loads`；④`event: error\ndata: boom\n\n` 的 `event=="error"`。
 
-**后续追问：** 源里有两个 SKU、用户只问其中一只，摘要只写一只算不算过；「30–45 天」这种区间你抽成两个点还是一个区间对象；别名表把「一个月」映射成 30，源其实写的是自然月，误杀还是漏杀。
+**后续追问：** `errors="replace"` 一旦误用，U+FFFD 会写进已经上屏的字，你怎样在测试里禁掉这条路径；注释行 `: keep-alive` 是否 flush；`data:` 空值按规范是向 data 缓冲追加一个空串（拼接后多出一个换行），你怎样避免把它当成事件结束。
 
 **扩展问题：**
-- 把别名表做成检查器配置并版本化，和把换算交给 LLM，各自会把哪类波动引进 CI？
-- 如何在冻结集里成对放「合法改写」和「换 SKU 偷天数」，证明门禁方向不是词面重合？
-- 失败解释模型把 30 说成「其实接近 90」，报告怎样防止值班把解释当成改写门禁的理由？
+- 把「码点缓冲」和「事件缓冲」画成两张状态图，标出只做其中一层时各会出哪类事故。
+- 如何用随机切分（把一段合法 SSE 在任意字节处切开再 `feed`）做属性测试，断言重组后事件序列不变？
+- `[DONE]` 写在 `event: message` 的 data 里，和写成单独注释行，产品语义差在哪，解码器要不要统一成同一种结束回调？
 
-**推理回答：** 目标是比较两个摘要 prompt 谁更少写错货号和天数。约束是量表分会锁评委口味，词重叠会放行数字错误。所以门禁做成可复算的槽位谓词，LLM 只注释失败，并用别名金样量出误杀面。
+**推理回答：** 目标是任意 TCP 切分下汉字不乱、事件不残。约束是 UTF-8 与 SSE 空行组帧是两层不同的完整性。所以字节层等码点、文本层等空行，`[DONE]` 与 `error` 不当增量 JSON。验收看四条字节夹具，而不是用已经 decode 好的字符串当输入。
 
 ## CODE-032. 不得拖爆首字时延 TTFT，却每隔 N 个 token 就要在尚未写完的草稿上跑一次偏题分类。怎样安排这个轻量分类器跟 decode 一起并行？写到一半像跑题、生成到第 120 个 token 又拉回正题时，分数来回翻转怎么拍板？
 
