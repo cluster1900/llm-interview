@@ -242,7 +242,7 @@
 
 **Reasoning:** Separate “how the model proposes a call” from “how several hosts reuse a capability.” Function calling already covers the first; the second is the reason to wrap. Use “will a second client or a second request format appear?” as the wrap switch, and keep “the model still selects tools via function calling” so the protocol is not mistaken for a reasoning skill.
 
-## AGENT-017. The MCP handshake has completed. Why shouldn't a client take for granted that the other side implements every optional feature?
+## AGENT-017. The MCP handshake has completed. Why shouldn't either side take for granted that its peer implements every optional feature?
 **Answer:** Protocol-version compatibility does not mean every optional capability is available. Taking the 2025-11-25 revision as an example, the two sides first negotiate the version and capabilities, then operate only on the declared capabilities; completing initialization also does not mean the user has authorized any business operation.
 **Deep dive:** The client sends initialize; the server returns the version and capabilities; the client then sends notifications/initialized. If the returned version is not supported by the client, disconnect rather than guessing compatibility; subsequent HTTP requests should carry the negotiated version header. Capability, concrete tool discovery, and business permission are three distinct checks.
 **Follow-ups:** If the server has the tools capability but not listChanged, can the client still list tools? Yes; the latter only describes list-change notification capability.
