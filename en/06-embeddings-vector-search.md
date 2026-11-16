@@ -429,3 +429,54 @@ lo, hi = np.quantile(means, [0.025, 0.975])
 - Which three items on the migration checklist must be release gates so this incident does not reach production again?
 
 **Reasoning:** The goal is to restore citation correctness, then explain. The constraint is that three root causes look like “quality dropped,” but mix and config can be falsified with cross-retrieval in half an hour. Lock version consistency, keep rollback ready, replay failures. True drift rolls back into dual indexes plus a business eval; you do not tune thresholds during the incident.
+
+## EMB-029. A RAG corpus has ten million passages, each with one 1024-dim float32 vector, and it does not fit in one machine's memory. A colleague proposes two moves: truncate vectors to the first 256 dims, and quantize every dim to 1 bit. How much memory does each save? Why is truncation trustworthy only for models trained Matryoshka-style, and how do you win back the recall lost to binarization with "coarse candidates + rescoring"?
+
+**Answer:** First the raw size: 10,000,000 × 1024 × 4 bytes = 40.96 GB ≈ 38.15 GiB, before any index structure. Truncating to 256 dims in float32 gives 10.24 GB ≈ 9.54 GiB, a 4× saving; binarizing all 1024 dims needs 128 bytes per vector, 1.28 GB ≈ 1.19 GiB in total, a 32× saving; both together (256 dims, 1 bit) is 32 bytes per vector, about 0.30 GiB, a 128× saving. Whether truncation works depends on training. Matryoshka representation learning (2022) puts a loss on several prefix lengths at once (for example 64, 128, 256, …), forcing the most important information into the leading dims, so the first 256 dims are a usable embedding on their own; OpenAI's text-embedding-3 series (2024) publicly supports returning vectors at a requested dimension. An ordinary model has no such constraint: information is spread over all dims, the first 256 are just an arbitrary subspace, and how much is lost can only be measured. After truncation you must L2-normalize again, and queries and documents must use the same dimension. Binarization keeps only the sign of each dim and compares by Hamming distance, so ranking becomes coarse and neighbor order gets scrambled. The remedy is two-stage: use Hamming distance to pick a few hundred candidates from the whole corpus (for example 400 if you want the top 10), then rescore those candidates with the full-precision query against their int8 or float32 document vectors. The full-precision vectors can live on SSD or in a memory-mapped file, because each query reads only a few hundred of them.
+
+**Deep dive:** Storage ledger first (vectors only, 10,000,000 of them):
+
+| Representation | Bytes per vector | Total | Versus float32×1024 |
+|---|---:|---:|---:|
+| float32 × 1024 | 4096 | 40.96 GB ≈ 38.15 GiB | 1× |
+| float32 × 256 (truncated) | 1024 | 10.24 GB ≈ 9.54 GiB | 4× |
+| int8 × 1024 | 1024 | 10.24 GB ≈ 9.54 GiB | 4× |
+| 1 bit × 1024 | 128 | 1.28 GB ≈ 1.19 GiB | 32× |
+| 1 bit × 256 | 32 | 0.32 GB ≈ 0.30 GiB | 128× |
+
+Do not forget the index. Take HNSW: common implementations store up to 2M neighbor ids per node on the bottom layer; with M = 32 that is 64 ids of 4 bytes, 256 bytes per vector, about 2.56 GB for ten million, already larger than the 1-bit × 1024 vectors themselves. So after binarization the graph overhead becomes the main cost; at that point you can skip the graph and scan all 1.28 GB of bit strings by Hamming distance, XOR then popcount, which is fast on a CPU and gives the exact Hamming top-k.
+
+The two-stage skeleton runs on a laptop:
+
+```python
+import numpy as np
+rng = np.random.default_rng(2)
+docs = rng.standard_normal((20000, 1024)).astype(np.float32)
+docs /= np.linalg.norm(docs, axis=1, keepdims=True)
+query = docs[123] + 0.02 * rng.standard_normal(1024).astype(np.float32)
+def trunc(v, k):                           # keep the first k dims, then re-normalize
+    v = v[..., :k]
+    return v / np.linalg.norm(v, axis=-1, keepdims=True)
+bits = np.packbits(docs > 0, axis=1)       # 1024 dims -> 128 bytes per doc
+qbits = np.packbits(query > 0)
+ham = np.unpackbits(bits ^ qbits, axis=1).sum(axis=1)
+cand = np.argsort(ham, kind="stable")[:400]          # cheap first stage
+exact = docs[cand] @ (query / np.linalg.norm(query)) # rescore on full vectors
+top10 = cand[np.argsort(-exact)[:10]]
+assert bits.shape == (20000, 128) and top10[0] == 123
+assert trunc(docs, 256).shape == (20000, 256)
+print("ok")
+```
+
+The random vectors here only make the code runnable; they say nothing about a real model's recall, which must be measured on your own queries. Why the sign bits still keep ranking information: if vector directions are roughly uniform across dims (for example after a random rotation), the probability that two vectors differ in sign on a given dim equals their angle divided by π, so Hamming distance is a noisy estimate of the angle. Real model embeddings often have non-zero per-dim means and uneven variances, so raw signs waste bits; subtracting the corpus's per-dim mean first, or using the binarization scheme the model provider recommends, usually does better.
+
+Do not accept on "how many GB we saved" alone. Using a batch of real queries that are labeled or can be judged by people, take full-precision exact top-10 as the baseline, measure recall@10 for truncation, binarization, and the two-stage path, and then measure end-to-end RAG answer accuracy. The main knob is the candidate count: more candidates mean more full-precision vectors read during rescoring and higher latency, with recall closer to full precision. Truncation and binarization both change the vectors, so ship them as a new index version and switch the query and document sides together; never mix them.
+
+**Follow-ups:** For a model not trained Matryoshka-style, can you run PCA first and then truncate, and what does that cost? When rescoring uses int8 on the document side and float32 on the query side, which side contributes most of the error? If coarse candidates go from 400 to 2000, how do latency and recall move?
+
+**Extended questions:**
+- Given a 4 GiB memory budget and ten million vectors, list two or three combinations (dimension, precision, index type) that fit and the recall risk of each.
+- Explain why truncated vectors must be re-normalized: use a two-dimensional example to show how cosine and dot-product rankings disagree without it.
+- After a binarization launch, only long queries lose noticeable recall. How do you investigate?
+
+**Reasoning:** Split the problem in two: does storage fit, and is ranking still accurate. Truncation saving 4× and binarization saving 32× is arithmetic; whether they are usable depends on whether information is concentrated in the leading dims and whether sign bits keep neighbor order, which depends on how the model was trained and on the data, so it must be measured. Lower recall after binarization is expected; the remedy is to let cheap Hamming distance only pick candidates and keep the final ranking on high-precision vectors. Ship the new representation as a new index version and accept it on real-query recall and end-to-end answer quality.

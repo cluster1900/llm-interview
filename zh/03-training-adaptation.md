@@ -533,3 +533,47 @@ assert pos[180] == 0 and pos[179] == 179
 - 单条超过 2048 时，打包、截断、调大 max length 各自先碰到哪条约束？
 
 **推理回答：** 目标是让宽度 2048 的矩阵乘落在真实回复 token 上，同时学到的条件仍是「这条提示对应这条回复」，位置相位也和线上从 0 开始的请求一致。块对角因果注意力、每条样本的 position id 归零、只在回复 token（含结束符）上计损失，是三只独立开关。填充率决定有用 tokens/sec；steps/sec 是否下降取决于原来 pad 有没有真的参与 FFN。单条已经顶满 2048 就不要指望打包。验收看回复 token/秒和跨样本泄漏探针，不看优化器每秒走了几步。
+
+## TRAIN-034. 同一份 SFT 配置，从「单卡 batch 16」改成「micro-batch 4 × 梯度累积 4」，样本是变长对话、只在回复 token 上计损失，结果 loss 曲线和下游分数都对不上了。为什么「每个 micro-batch 先按 token 取均值，再对 4 个累积步取平均」不等于大 batch 的 token 均值？偏差有多大、会把模型往哪边推？换到 8 卡 DDP 时分母又该怎么定？
+
+**答：** 想要的目标是整个累积窗口里所有非忽略 token 的平均损失：L = Σ_j ℓ_j / N，N 是窗口内全部回复 token 数。常见写法对每个 micro-batch 先算 Σ_{j∈i} ℓ_j / n_i，再除以累积步数 G 相加，等价于给 micro-batch i 里的每个 token 权重 1/(G·n_i)，而正确权重是 1/N。只有各 micro-batch 的 n_i 相等时两者才一致。举例：四个 micro-batch 的回复 token 数是 1200、300、80、420，N = 2000，G = 4。正确权重 1/2000；朴素写法下四组的权重分别是正确值的 0.417、1.667、6.25、1.19 倍，80 那组里的一个 token 抵得上 1200 那组的 15 个。偏差不只是标度，梯度方向也变了：回复短的样本里的 token 被放大、长回复被压低，模型更偏向拟合这些样本，损失曲线还会随每步的长度组合抖动。修法是先数清窗口内（以及所有卡上）的非忽略 token 总数 N，每个 micro-batch 只回传 Σ ℓ_j / N，累积 G 步后的梯度就和一次性吃下整个窗口完全相同。DDP 默认在 all-reduce 时对 W 张卡取平均，所以若每张卡都除以全局 N，还要再乘 W（或者每张卡改除以 N/W），否则梯度小了 W 倍。
+
+**深入展开：** 先把等价性跑出来，而不是靠口头推导。下面用每个 token 一个平方损失的线性模型，比较三种写法：
+
+```python
+import numpy as np
+rng = np.random.default_rng(1)
+counts = [1200, 300, 80, 420]              # non-ignored tokens per micro-batch
+X = [rng.standard_normal((n, 4)) for n in counts]
+Y = [rng.standard_normal(n) for n in counts]
+w = np.zeros(4)
+def grad_sum(x, y):                         # d/dw of sum over tokens of 0.5*(x@w - y)^2
+    return x.T @ (x @ w - y)
+N = sum(counts)
+full = grad_sum(np.vstack(X), np.concatenate(Y)) / N        # one big batch, token mean
+naive = sum(grad_sum(x, y) / len(y) for x, y in zip(X, Y)) / len(counts)
+fixed = sum(grad_sum(x, y) / N for x, y in zip(X, Y))       # divide by window total
+assert np.allclose(fixed, full)
+assert not np.allclose(naive, full)
+cos = naive @ full / np.linalg.norm(naive) / np.linalg.norm(full)
+print("naive vs full cosine", round(float(cos), 4))
+```
+
+这个固定种子的玩具里，朴素写法和整批梯度的余弦只有约 0.59：它不是「学习率差个系数」，而是在往另一个方向走。真实 SFT 里，micro-batch 的 n_i 取决于这几条对话的回复长短，差几倍很常见；打包成满行也只能让「总 token」接近，被忽略的 prompt 比例仍然在变，n_i 照样不等。
+
+什么时候朴素写法恰好没错：预训练那种定长行、每个位置都计损失，每个 micro-batch 的 n_i 天然相同。所以同一套代码在预训练上没问题，挪到「只在回复上计损失」的 SFT 或偏好数据上才暴露。2024 年开源训练库里有过一次广为讨论的修正，症状正是「开梯度累积后 loss 比不开时偏高、且越长的累积越明显」。
+
+工程上要改三处。第一，分母要提前知道：在跑窗口内第一个 micro-batch 的前向之前，先把 G 个 micro-batch 的 label 取出来数非忽略 token；多卡时再对这个整数做一次 all-reduce（一个标量，代价可以忽略）。第二，损失求和用 fp32 累加，避免 bf16 下长序列求和丢精度。第三，日志里的 loss 用 Σ(损失和) / Σ(token 数) 报，而不是 micro-batch 均值的均值，否则曲线本身就在骗人。
+
+还有一个独立的选择要说清：按 token 平均还是按样本平均。按样本平均是先在每条对话内取均值、再在样本间平均，每条对话权重相同，长回复里的单个 token 权重更低。两种都可以是合理的目标，但必须在「不累积」和「累积 + 多卡」两种跑法下是同一个目标。验收的办法很直接：同一批数据、同一个初始权重，分别用 batch 16 单步和 4×4 累积跑一步，比较两次的梯度（或更新后的权重），差应在数值误差量级。
+
+梯度裁剪放在累积结束、all-reduce 之后，对完整梯度做一次。改了归一化以后，梯度范数的量级可能和以前不同，裁剪阈值要重新看一眼，不能照搬旧配置。
+
+**后续追问：** 窗口内的 token 数必须提前知道，数据加载器是流式的、拿不到后面几个 micro-batch 时怎么办？按样本平均的方案在累积和多卡下要怎样写才等价？DPO 这类按序列对计损失的目标，会不会有同类问题？
+
+**扩展问题：**
+- 用 1200、300、80、420 四组，写出朴素写法、按窗口 token 总数归一、按样本平均三种方案下每个 token 的权重。
+- 8 卡 DDP、每卡累积 4 步，写出每张卡上 loss 应除以的数，并说明 DDP 的梯度平均怎样影响这个数。
+- 只有日志、没有代码权限时，怎样用两次短实验判断某个训练框架有没有这个问题？
+
+**推理回答：** 目标函数先于实现：先写出想优化的是窗口内全部回复 token 的平均损失，再检查每种写法给每个 token 的实际权重。朴素写法的权重随 micro-batch 内 token 数变化，只有 n_i 全等时才与目标一致，所以问题只在变长、带忽略 label 的数据上出现。修法是把分母换成整个窗口、所有卡上的 token 总数，并补上 DDP 平均带来的 W 倍。验收用「累积与不累积的单步梯度一致」这一条，而不是看 loss 曲线是否好看。
