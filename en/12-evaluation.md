@@ -611,3 +611,43 @@ The figures 30, 0.173, 0.543, 520, and 20 are scale and sample-size arithmetic. 
 - Write σ with a position term, a length term, and a judge term. With no side-swapped games and A always on the left, which two terms cannot be identified?
 
 **Reasoning:** The goal is a strength that stays comparable across opponent pools, plus an interval, not a table of win rates. The logistic scale shared by Bradley-Terry and Elo turns 30 Elo points into about 0.173 nats and about 4.3 percentage points of win rate, which shows that about 520 direct battles are where a 95% interval just resolves the gap, and 20 do not. Left/right order, length, and judge identity enter the same σ as controls, or they masquerade as r. Accept when the interval is a resample of battles, the anchor is fixed, and position is randomized — not when the win-rate sort looks tidy.
+
+## EVAL-043. A reading-comprehension eval has 1200 questions drawn from 150 passages, 8 per passage. The new model scores 72%, and the report computes its error bar from √(p(1−p)/n) as ±2.5 percentage points. Questions under the same passage share difficulty and tend to be right or wrong together. Why is that error bar too narrow? With an intra-cluster correlation of 0.3, how wide is the real error bar and how many independent questions is the set worth? How should you compute it when comparing two models, or when each question is sampled several times?
+
+**Answer:** √(p(1−p)/n) assumes the 1200 questions are independent. Questions from the same passage share material and difficulty: if the model reads a passage well, its 8 questions are mostly right together, and if it misreads, they are wrong together, so they carry far less information than 8 independent questions. The naive standard error is √(0.72×0.28/1200) ≈ 1.30 points, and the 95% half-width is 1.96×1.30 ≈ 2.54 points. Using the cluster-sampling design effect 1 + (m − 1)ρ with m = 8 questions per passage and intra-cluster correlation ρ = 0.3, the design effect is 3.1; the standard error is multiplied by √3.1 to about 2.28 points, and the 95% half-width becomes about 4.47 points. The effective sample size is only 1200/3.1 ≈ 387 "independent questions." The right tool is a passage-clustered standard error: sum deviations within each passage first, then take the variance across passages; you do not need to know ρ in advance. To compare two models, take the difference on each question (paired by question) and compute a passage-clustered standard error of those differences; pairing cancels question difficulty and clustering handles within-passage correlation, and you need both. When each question is sampled k times at temperature above 0, average within the question first to get a question-level score, then apply the same method; more samples only reduce the variance from "the same question answered randomly," not the variance from "which questions and passages were drawn."
+
+**Deep dive:** The variance splits into three layers: between passages (some passages are just hard), between questions within a passage, and between repeated samples of the same question. Let σ²_a, σ²_q, and σ²_s be the three layers' variances, with A passages, m questions per passage, and k samples per question; the variance of the mean score is about σ²_a/A + σ²_q/(A·m) + σ²_s/(A·m·k). More questions shrink the last two terms, more passages shrink all three, and more samples shrink only the last one. So when the passage layer dominates, the same labeling budget does much more as "more passages, fewer questions each" than as "more questions per passage."
+
+The clustered standard error itself is a few lines:
+
+```python
+import numpy as np
+def cluster_se(x, cluster):
+    """Standard error of mean(x) when items are grouped by cluster (e.g. passage)."""
+    x = np.asarray(x, float); n = len(x); dev = x - x.mean()
+    sums = np.array([dev[cluster == c].sum() for c in np.unique(cluster)])
+    C = len(sums)
+    return np.sqrt(C / (C - 1) * (sums ** 2).sum()) / n   # with small-sample factor
+rng = np.random.default_rng(3)
+cluster = np.repeat(np.arange(150), 8)                     # 150 passages x 8 questions
+ease = rng.normal(0, 1.2, 150)[cluster]                    # shared passage difficulty
+x = (rng.normal(0, 1, 1200) + ease > -0.75).astype(float)
+naive = x.std(ddof=1) / np.sqrt(len(x))
+print(round(x.mean(), 3), round(naive, 4), round(cluster_se(x, cluster), 4))
+assert cluster_se(x, cluster) > naive
+```
+
+In this fixed-seed simulation, accuracy is 0.704, the naive standard error 0.0132, and the clustered one 0.0257; the squared ratio is about 3.79, a design effect near 4. The passage-difficulty variance in the simulation was picked arbitrarily; compute the real design effect from your own data with the function above, and do not copy 3.1 or 3.79.
+
+How to write the paired comparison: for each question compute d_i = model B's score − model A's score; the mean is the gap, and its standard error is cluster_se(d, cluster). Two models tend to do well or badly on the same passages together, and pairing cancels that shared difficulty, so the standard error of the difference is usually smaller than "the root-sum-square of two independent accuracy standard errors"; within-passage correlation is still there, so you still cluster. Report the gap, the clustered standard error, the 95% interval, and the number of passages and questions.
+
+When not to cluster: questions that come from independent sources to begin with (each from a different document and author), or clusters of size one. Check by computing both the clustered and naive standard errors; if they are close, the intra-cluster correlation is small. Another easily missed cluster is "a set of questions generated from one template with different numbers"; like questions under one passage, they tend to be right or wrong together.
+
+**Follow-ups:** With only 20 passages of 60 questions each, is the clustered standard error itself still reliable? Questions are grouped both by passage and by question type; how do you handle two crossed clusterings? If the new model improves a lot on only a few passages, does that count as "better overall"?
+
+**Extended questions:**
+- The budget covers 400 more labeled questions: do you write 50 passages × 8 or 200 passages × 2? Justify it with the variance decomposition.
+- Two models differ by 3 points; the naive interval excludes 0 and the clustered one includes 0. How do you state the conclusion in the report?
+- Raising samples per question from 1 to 5 leaves the clustered standard error almost unchanged. What does that tell you?
+
+**Reasoning:** An error bar measures "how much would the score move on another batch of similar questions," so first ask what the sampling unit is. Here what was sampled is passages, and questions come along with them, so there are 150 independent units, not 1200. The naive formula treats correlated questions as independent and makes the interval about √3.1 times too narrow. Compute passage-clustered standard errors, pair before clustering when comparing models, and average repeated samples within each question first. Draw a conclusion only when the clustered interval supports it.

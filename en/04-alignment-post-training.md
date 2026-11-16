@@ -345,3 +345,61 @@ Accept on two places at once: reward or pass rate on the selected set beats a si
 - Write three discard rules: length residual, log probability under the reference policy, and a hidden test. Which one specifically blocks long flattery?
 
 **Reasoning:** The goal is one offline filter that moves SFT data into the high-score region of the current policy. The constraints are a biased reward, a limited sampling support, and an update graph with no trust region. Keep the graph as sample, score, likelihood on the winner. Use a normal order statistic for the marginal value of N, use temperature so the samples are not copies, and use a length baseline plus a hidden check to cut exploits at the maximum. N saturates first. After that, switch to an online method with a KL instead of stacking more samples.
+
+## ALIGN-026. In RLHF or GRPO you want to keep the policy π_θ close to a reference model π_ref, but you only have tokens sampled from π_θ itself. With r = π_ref/π_θ, consider three single-sample KL estimators k1 = −log r, k2 = ½(log r)², and k3 = (r − 1) − log r. Which are unbiased, which can go negative, and which has more variance? Why is the gradient you get when one of them is a penalty inside the reward different from the gradient you get when it is added to the loss and left to autograd?
+
+**Answer:** Let q = π_θ and p = π_ref, with samples x ~ q; the target is the reverse KL(q‖p) = E_q[log(q/p)]. k1 = log(q/p) has expectation exactly KL, so it is unbiased; but a single sample can be negative (whenever π_θ gives a token less probability than the reference), and its variance is large. k2 = ½(log r)² is always non-negative and low-variance, but biased: its expectation matches KL only to second order when q and p are close. For k3 = (r − 1) − log r: since E_q[r] = Σ_x p(x) = 1, E_q[r − 1] = 0, so E[k3] = E[k1] = KL and it is unbiased too; and since x − 1 − log x ≥ 0, every sample is non-negative and its variance is usually lower than k1's. A four-token toy: q = [0.5, 0.3, 0.15, 0.05], p uniform, true KL ≈ 0.2442. k1 has mean 0.2442, std 0.5994, minimum −1.6094; k2 has mean 0.2094 (about 14% low), std 0.2674; k3 has mean 0.2442, std 0.4985, but hits 2.3906 on the token where q is only 0.05. Gradients must be treated separately. As a penalty in the reward optimized by policy gradient, each estimator is estimating the value of KL, and for k1 the expected gradient is exactly the reverse-KL gradient. Put directly into the loss with the samples treated as constants, things change: k1's expected gradient is 0, k2 gives the gradient of the reverse KL(q‖p), and k3 gives the gradient of the forward KL(p‖q). GRPO, introduced with DeepSeekMath (2024), writes exactly the k3 form into the loss.
+
+**Deep dive:** Lay out the estimates first (all values are exact for the q and p above, not sampled):
+
+| Estimator | Value per token | Mean | Std | Unbiased | Can be negative |
+|---|---|---:|---:|---|---|
+| k1 = −log r | 0.6931, 0.1823, −0.5108, −1.6094 | 0.2442 | 0.5994 | yes | yes |
+| k2 = ½(log r)² | 0.2402, 0.0166, 0.1305, 1.2951 | 0.2094 | 0.2674 | no | no |
+| k3 = (r−1) − log r | 0.1931, 0.0157, 0.1558, 2.3906 | 0.2442 | 0.4985 | yes | no |
+
+The forward KL(p‖q) in this example is 0.3112, different from the reverse 0.2442; the gradient results below are about telling these two apart.
+
+The gradients can be derived directly or checked numerically. With the samples treated as constants (stop-gradient on the sampling distribution): ∇k1 = ∇log q and E_q[∇log q] = 0; ∇k2 = log(q/p)·∇log q, whose expectation is exactly ∇KL(q‖p); ∇k3 = (1 − r)·∇log q, whose expectation is E_q[∇log q] − Σ_x p(x)∇log q(x) = ∇[−E_p log q] = ∇KL(p‖q). The code below uses finite differences on softmax logits and asserts all three:
+
+```python
+import numpy as np
+p = np.array([0.25, 0.25, 0.25, 0.25])     # reference policy
+theta = np.log(np.array([0.5, 0.3, 0.15, 0.05]))
+soft = lambda t: np.exp(t - t.max()) / np.exp(t - t.max()).sum()
+def surrogate(t, which, q_sample):
+    q = soft(t); lr = np.log(p / q); r = p / q
+    k = {"k1": -lr, "k2": 0.5 * lr**2, "k3": (r - 1) - lr}[which]
+    return float(q_sample @ k)             # samples drawn from a frozen q
+def num_grad(f, t, eps=1e-6):
+    g = np.zeros_like(t)
+    for i in range(len(t)):
+        e = np.zeros_like(t); e[i] = eps
+        g[i] = (f(t + e) - f(t - e)) / (2 * eps)
+    return g
+q0 = soft(theta)
+rev = num_grad(lambda t: float(soft(t) @ np.log(soft(t) / p)), theta)   # grad KL(q||p)
+fwd = num_grad(lambda t: float(p @ np.log(p / soft(t))), theta)         # grad KL(p||q)
+g2 = num_grad(lambda t: surrogate(t, "k2", q0), theta)
+g3 = num_grad(lambda t: surrogate(t, "k3", q0), theta)
+g1 = num_grad(lambda t: surrogate(t, "k1", q0), theta)
+assert np.allclose(g2, rev, atol=1e-6)     # k2 as a loss -> reverse-KL gradient
+assert np.allclose(g3, fwd, atol=1e-6)     # k3 as a loss -> forward-KL gradient
+assert np.allclose(g1, 0, atol=1e-6)       # k1 as a loss -> zero in expectation
+print("ok")
+```
+
+This has three engineering consequences. First, "k3 is unbiased, non-negative, and low-variance" is about estimating the value of KL; it suits monitoring curves and reward penalties, and it does not by itself guarantee the gradient direction when used as a loss. Second, adding k3 directly to the loss minimizes the forward KL in expectation: forward KL tends to cover the regions where the reference has probability and pulls π_θ back toward tokens the reference keeps; reverse KL tends to say "do not go where the reference disagrees." The two differ little when q≈p and more the further apart they are. Third, k1 used directly as a loss imposes no constraint in expectation, only noise; the InstructGPT (2022) style puts −β·log(π_θ/π_ref) into the per-token reward and then runs policy gradient, and that path is what corresponds to the reverse KL.
+
+Watch k3's tail too: r = π_ref/π_θ grows when π_θ pushes a reference-approved token very low, k3 grows roughly linearly in r, and an occasional large value can dominate that token's loss. Common stabilizers are computing in log space, clipping log r, and logging both the mean and a high quantile of the KL estimate. If training is off-policy (samples from an older policy), you also need importance ratios before the expectation arguments above hold.
+
+Keep the sequence level separate too: the KL of a whole response is the sum of per-token log ratios; computing k3 per token and summing is not the same quantity as k3 on the whole-sequence ratio, although both have the sequence KL as their expectation.
+
+**Follow-ups:** If you want k3's low variance but the reverse-KL gradient, how should the loss be written? After raising β the reward stops improving; how do you tell whether the KL term is too strong or the estimator is too noisy? When old off-policy samples are reused for several epochs, what corrections does the KL term need?
+
+**Extended questions:**
+- Using the four tokens in the table, compute by hand why k3 is 2.3906 on the q = 0.05 token, and explain what such tokens mean during training.
+- Prove x − 1 − log x ≥ 0 and explain what the equality condition means for KL estimation.
+- Under the same GRPO config, if you move the KL term from the loss into the reward, how do you expect training dynamics to change, and which curves do you monitor?
+
+**Reasoning:** Separate two questions first: estimating the value of KL, and taking the gradient of KL. For the value, look at bias and variance: k3 is both unbiased and non-negative, k2 is biased but the most stable, k1 is unbiased but noisy. For the gradient, check what autograd actually differentiates: once the sampling distribution is a constant, k2 maps to reverse KL, k3 to forward KL, and k1 does nothing in expectation. So decide the direction of the constraint before choosing an estimator, then decide whether KL lives in the reward or the loss, and confirm with a small numerical check that the gradient is the one you meant.

@@ -345,3 +345,61 @@
 - 写出三条丢弃规则：长度残差、相对参考策略的对数概率、隐藏测试。哪一条专门挡住奉承长文？
 
 **推理回答：** 目标是用一次离线过滤，把 SFT 数据搬到当前策略的高分区域。约束是奖励有偏、采样支持集有限、更新图里没有信任域。计算图保持「采样、打分、对赢家做似然」。用正态次序统计估计 N 的边际，用温度让样本不要完全相同，用长度基线和隐藏检查截住最大值上的漏洞。N 的收益先饱和；饱和之后换带 KL 的在线方法，而不是继续堆采样。
+
+## ALIGN-026. RLHF 或 GRPO 里要约束策略 π_θ 别离参考模型 π_ref 太远，可手上只有 π_θ 自己采出来的 token。记 r = π_ref/π_θ，三种单样本 KL 估计 k1 = −log r、k2 = ½(log r)²、k3 = (r − 1) − log r，哪个无偏、哪个会出负数、方差谁大？把它们当奖励里的惩罚项用，和直接加进损失让自动求导去算，得到的梯度为什么不是同一回事？
+
+**答：** 记 q = π_θ、p = π_ref，样本 x ~ q，要估的是反向 KL(q‖p) = E_q[log(q/p)]。k1 = log(q/p) 的期望正好是 KL，无偏；但单个样本可以是负数（π_θ 给某个 token 的概率低于参考模型时），方差大。k2 = ½(log r)² 永远非负、方差小，但有偏：只有 q、p 很接近时它的期望才和 KL 一致到二阶。k3 = (r − 1) − log r：因为 E_q[r] = Σ_x p(x) = 1，E_q[r − 1] = 0，所以 E[k3] = E[k1] = KL，同样无偏；又因为 x − 1 − log x ≥ 0，每个样本都非负，通常方差也比 k1 小。用一个四个 token 的玩具：q = [0.5, 0.3, 0.15, 0.05]，p 均匀，真实 KL ≈ 0.2442。k1 均值 0.2442、标准差 0.5994、最小值 −1.6094；k2 均值 0.2094（偏低约 14%）、标准差 0.2674；k3 均值 0.2442、标准差 0.4985，但在 q 只有 0.05 的那个 token 上取到 2.3906。梯度要分开看：当成奖励惩罚、用策略梯度去优化时，三者估的都是「KL 的值」，对 k1 来说期望梯度正好是反向 KL 的梯度。直接放进损失、把采样当常数求导时，结果变了：k1 的期望梯度是 0，k2 给出的是反向 KL(q‖p) 的梯度，k3 给出的却是正向 KL(p‖q) 的梯度。DeepSeekMath（2024）提出的 GRPO 正是把 k3 形式直接写进损失。
+
+**深入展开：** 估计值的账先列清楚（数值都按上面的 q、p 精确计算，不是抽样）：
+
+| 估计器 | 每个 token 的取值 | 均值 | 标准差 | 是否无偏 | 会不会为负 |
+|---|---|---:|---:|---|---|
+| k1 = −log r | 0.6931, 0.1823, −0.5108, −1.6094 | 0.2442 | 0.5994 | 是 | 会 |
+| k2 = ½(log r)² | 0.2402, 0.0166, 0.1305, 1.2951 | 0.2094 | 0.2674 | 否 | 不会 |
+| k3 = (r−1) − log r | 0.1931, 0.0157, 0.1558, 2.3906 | 0.2442 | 0.4985 | 是 | 不会 |
+
+正向 KL(p‖q) 在这个例子里是 0.3112，和反向的 0.2442 不同，下面的梯度结论就是要区分这两个数。
+
+梯度部分可以直接推，也可以数值验证。把样本当常数（stop-gradient 采样分布）时：∇k1 = ∇log q，E_q[∇log q] = 0；∇k2 = log(q/p)·∇log q，期望正是 ∇KL(q‖p)；∇k3 = (1 − r)·∇log q，期望 E_q[∇log q] − Σ_x p(x)∇log q(x) = ∇[−E_p log q] = ∇KL(p‖q)。下面的代码用 softmax logits 做有限差分，把三条都断言出来：
+
+```python
+import numpy as np
+p = np.array([0.25, 0.25, 0.25, 0.25])     # reference policy
+theta = np.log(np.array([0.5, 0.3, 0.15, 0.05]))
+soft = lambda t: np.exp(t - t.max()) / np.exp(t - t.max()).sum()
+def surrogate(t, which, q_sample):
+    q = soft(t); lr = np.log(p / q); r = p / q
+    k = {"k1": -lr, "k2": 0.5 * lr**2, "k3": (r - 1) - lr}[which]
+    return float(q_sample @ k)             # samples drawn from a frozen q
+def num_grad(f, t, eps=1e-6):
+    g = np.zeros_like(t)
+    for i in range(len(t)):
+        e = np.zeros_like(t); e[i] = eps
+        g[i] = (f(t + e) - f(t - e)) / (2 * eps)
+    return g
+q0 = soft(theta)
+rev = num_grad(lambda t: float(soft(t) @ np.log(soft(t) / p)), theta)   # grad KL(q||p)
+fwd = num_grad(lambda t: float(p @ np.log(p / soft(t))), theta)         # grad KL(p||q)
+g2 = num_grad(lambda t: surrogate(t, "k2", q0), theta)
+g3 = num_grad(lambda t: surrogate(t, "k3", q0), theta)
+g1 = num_grad(lambda t: surrogate(t, "k1", q0), theta)
+assert np.allclose(g2, rev, atol=1e-6)     # k2 as a loss -> reverse-KL gradient
+assert np.allclose(g3, fwd, atol=1e-6)     # k3 as a loss -> forward-KL gradient
+assert np.allclose(g1, 0, atol=1e-6)       # k1 as a loss -> zero in expectation
+print("ok")
+```
+
+这件事在工程上有三层含义。第一，「k3 无偏、非负、方差小」说的是估计 KL 的数值，适合做监控曲线和奖励惩罚；它不自动保证当损失时的梯度方向。第二，把 k3 直接加进损失，期望上是在最小化正向 KL：正向 KL 偏向「覆盖」参考模型有概率的区域，会把 π_θ 往参考模型保留的那些 token 上拉；反向 KL 偏向「别去参考模型不认可的地方」。两者在 q≈p 时相差不大，偏离越远差别越明显。第三，k1 直接当损失在期望上没有约束作用，只剩噪声；InstructGPT（2022）那一类做法是把 −β·log(π_θ/π_ref) 作为逐 token 奖励的一部分，再走策略梯度，那条路才对应反向 KL。
+
+k3 的尾巴也要留意：r = π_ref/π_θ 在 π_θ 把某个参考模型认可的 token 压得很低时会变大，k3 大约随 r 线性增长，偶发的大值会让这一项主导该 token 的损失。常见的稳定手段是在 log 空间里算、对 log r 做截断，并分别记录 KL 估计的均值和高分位。若训练是离策略的（样本来自旧策略），还要乘重要性比率，上面的期望推导才成立。
+
+序列层面也要分清：整段回复的 KL 是逐 token log 比值的和；逐 token 算 k3 再相加，与「对整段的比值算 k3」不是同一个量，但两者期望都等于序列 KL。
+
+**后续追问：** 如果想要「k3 的低方差」又想要反向 KL 的梯度，损失该怎么写？β 调大以后奖励不涨了，你怎么判断是 KL 项太强还是估计器方差太大？离策略的旧样本复用多轮时，KL 项需要哪些修正？
+
+**扩展问题：**
+- 用表里的四个 token，手算 k3 在 q = 0.05 那个 token 上为什么是 2.3906，并说明这类 token 在训练中意味着什么。
+- 证明 x − 1 − log x ≥ 0，并说明等号成立的条件对 KL 估计意味着什么。
+- 同一份 GRPO 配置，把 KL 项从损失里挪到奖励里，你预计训练动态会怎样变，监控上看哪几条曲线？
+
+**推理回答：** 先分清两个问题：估计 KL 的数值，和对 KL 求梯度。估计数值时看偏差和方差，k3 兼得无偏和非负，k2 有偏但最稳，k1 无偏但噪声大。求梯度时要看自动求导实际对哪个式子求导：采样分布被当成常数后，k2 对应反向 KL，k3 对应正向 KL，k1 在期望上没有作用。所以选估计器之前先定约束的方向，再决定 KL 放在奖励里还是损失里，并用小规模数值检查确认梯度确实是你想要的那一个。

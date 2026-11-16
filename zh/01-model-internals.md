@@ -716,3 +716,61 @@ Gloeckle 等人（2024）的 Multi-Token Prediction 是共享主干，n 个预�
 - 推理只部署第 1 个头时，草稿从哪来；若把第 4 个头的采样直接追加进上下文，训练时的哪一条条件被换成了别的分布？
 
 **推理回答：** 目标是在不改写已经要上线的自回归分解的前提下，用真实未来 token 给主干多几路监督，并留一批可选的草稿头。约束是因果教师强制，以及 logit 和优化器状态随 n 线性涨。于是共享主干，n 个头都读 h_t，只对 x_{t+k} 做交叉熵；decode 只采样第 1 个头，其余输出只当未核验提议。n 由第 1 个头的持出困惑度，以及 Adam / logit / 权重三行显存账共同决定。独立满头先按 n·d·V·2 字节算清，并与优化器状态对照，再决定是否改成共享 LM head 加小适配器。
+
+## ARCH-047. 长上下文服务的显存几乎全被 KV cache 占满。DeepSeek-V2（2024）的多头潜在注意力（MLA）每层只缓存一个低秩潜向量和一小段带位置的键。按它公开的配置（128 头、每头 128 维、潜向量 512 维、解耦 RoPE 键 64 维、60 层）算，每个 token 的缓存比标准 MHA 小多少倍，相当于几组 GQA？推理时键、值的上投影为什么能并进查询和输出投影，RoPE 又为什么逼出一条单独的位置分支？
+
+**答：** MLA 先把隐状态 h_t 压成潜向量 c_t = W_DKV·h_t（512 维），每个头的键、值再由 c_t 上投影得到：k_i = W_UK,i·c_t，v_i = W_UV,i·c_t。缓存里只放 c_t，外加一段所有头共用、单独过 RoPE 的 64 维键 k_t^R。每层每 token 的缓存元素数：MHA 是 2×128×128 = 32,768，MLA 是 512+64 = 576，约小 56.9 倍；按 GQA 的口径，576/(2×128) = 2.25，相当于只有 2.25 组的 GQA。bf16、60 层合计：MHA 每 token 3,932,160 字节（3.75 MiB），MLA 69,120 字节（67.5 KiB）；一条 131,072 token 的序列，MHA 要 480 GiB，MLA 约 8.44 GiB。能这样省的前提是「吸收」：注意力分数 q_i·k_i = (W_Q,i·h_t)ᵀ(W_UK,i·c_s) = (W_UK,iᵀ·W_Q,i·h_t)ᵀ·c_s，中间的 W_UK,iᵀ·W_Q,i 是常量，可以预先乘好，于是查询直接和缓存里的潜向量点积，不必为历史 token 重建完整的键；值那一侧同理，W_UV,i 并进输出投影 W_O。RoPE 破坏了这个结合律：如果把旋转作用在上投影出来的键上，分数里夹着 R(t)ᵀR(s)，它随两个位置的差变化，就不存在一个固定的吸收矩阵。DeepSeek-V2 的做法是让内容部分完全不带位置，只靠另开的 64 维 q^R、k^R 承载 RoPE，两部分的点积相加再进 softmax。
+
+**深入展开：** 先把账本写成表。
+
+| 方案 | 每层每 token 元素 | bf16、60 层每 token | 131,072 token 一条序列 |
+|---|---:|---:|---:|
+| MHA（128 头 × 128 维，K+V） | 32,768 | 3,932,160 B = 3.75 MiB | 480 GiB |
+| GQA 8 组 | 2,048 | 245,760 B = 240 KiB | 30 GiB |
+| MLA（512 + 64） | 576 | 69,120 B = 67.5 KiB | 8.4375 GiB |
+
+GQA 8 组仍比 MLA 大 2048/576 ≈ 3.56 倍。省下来的不是参数，而是每生成一个 token 都要从 HBM 读一遍的字节：decode 受显存带宽约束，KV 越小，同样的带宽能撑起越大的批和越长的上下文。
+
+吸收是一个可以当场验证的线性代数事实，RoPE 打破它也可以：
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+d, dc, dh = 64, 16, 8                      # toy sizes: model, latent, head
+W_Q  = rng.standard_normal((dh, d))        # query projection of one head
+W_DKV = rng.standard_normal((dc, d))       # shared down-projection -> cached latent c
+W_UK = rng.standard_normal((dh, dc))       # per-head key up-projection
+h_t, h_s = rng.standard_normal(d), rng.standard_normal(d)
+c_s = W_DKV @ h_s                          # only this (dc numbers) is cached
+explicit = (W_Q @ h_t) @ (W_UK @ c_s)      # rebuild key, then dot
+W_absorb = W_UK.T @ W_Q                    # (dc, d), precomputed once
+absorbed = (W_absorb @ h_t) @ c_s          # dot directly against the latent
+assert np.isclose(explicit, absorbed)
+
+def rot(pos, n=dh, base=10000.0):          # RoPE as a block-diagonal rotation
+    R = np.zeros((n, n))
+    for i in range(n // 2):
+        a = pos * base ** (-2 * i / n)
+        R[2*i:2*i+2, 2*i:2*i+2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
+    return R
+# with RoPE on the up-projected key, the middle matrix depends on the offset
+M = lambda t, s: W_Q.T @ rot(t).T @ rot(s) @ W_UK
+assert np.allclose(M(5, 3), M(9, 7))        # same offset: same matrix
+assert not np.allclose(M(5, 3), M(5, 1))    # different offset: no single W_absorb
+print("ok")
+```
+
+解耦之后，位置分支的键 k_t^R 由 h_t 直接投影再旋转，所有头共用一份，所以只多缓存 64 维；每个头各有自己的 q^R。内容分支不旋转，吸收照常成立。代价是位置信息只走 64 维的窄通道，内容分支本身对位置不敏感；这是有意的取舍，不是缺陷。
+
+吸收之后的 decode 形态很像 MQA：128 个头读同一份 576 维的缓存，每个头的查询先被映射到 512 维潜空间。每读一字节 KV 能做的乘加变多，算术强度上去了，带宽瓶颈缓解；但每个头的点积从 128+64 维变成 512+64 维，FLOPs 变多。所以常见实现是两套路径：prefill 本来就受算力约束，显式上投影出每头的 K、V，用普通注意力核；decode 受带宽约束，走吸收后的潜空间路径。查询那一侧在 DeepSeek-V2 里也做了低秩压缩，那是为了省训练时的激活，和 KV cache 无关，不要混进缓存的账里。
+
+边界条件：MLA 是训练时就定下的结构，一个已经训好的 MHA 检查点不能靠离线矩阵分解直接变成 MLA 而不掉质量，至少要做一段继续训练并重新评测。缓存潜向量也不等于可以随意量化：c_t 同时承载所有头的键和值，量化误差会被 128 个上投影同时放大，FP8 一类的 KV 量化要单独做长上下文评测。
+
+**后续追问：** 为什么不干脆把 RoPE 加在潜向量 c_t 上？位置分支只有 64 维，超长上下文外推（YaRN 一类缩放）作用在哪一部分？decode 走吸收路径时，单个头的 FLOPs 比显式路径多出多少，什么批大小下这笔账开始不划算？
+
+**扩展问题：**
+- 用表里的数字算：一张 80 GiB 的卡扣掉权重后剩 40 GiB 给 KV，MHA、GQA 8 组、MLA 各能放下多少个 32k token 的会话？
+- 解释为什么 k^R 可以所有头共享，而 q^R 必须每头一份；如果 k^R 也每头一份，缓存会变成多少？
+- 想把现有 GQA 模型改成 MLA 来省显存，你会怎样设计继续训练和验收，哪些长上下文指标最先暴露问题？
+
+**推理回答：** 目标是让 decode 每步读的 KV 字节尽量少，又不把注意力退化成 MQA 那样所有头共用同一份 K、V。路径是先把缓存对象从「每头的 K、V」换成「所有头共用的低秩潜向量」，再靠矩阵结合律把上投影挪到查询和输出那一侧，使缓存真的只存 576 个数。RoPE 让中间矩阵随位置差变化，结合律失效，所以位置信息必须另走一条不参与吸收的窄分支。验收时同时看三件事：每 token 缓存字节、decode 吞吐和长上下文质量；不要只报 56.9 倍这个压缩比。

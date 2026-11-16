@@ -533,3 +533,47 @@ Accept on two numbers: non-pad, non-ignored response tokens per second, and a le
 - When a single sample exceeds 2048, which constraint does packing, truncation, or raising max length hit first?
 
 **Reasoning:** The goal is a width-2048 GEMM spent on real response tokens, a conditional that is still "this prompt, this response," and a position phase that matches a live request starting at 0. Block-diagonal causal attention, position ids restarted per sample, and loss only on response tokens (including the end-of-turn id) are three separate switches. Fill rate sets useful tokens/sec. Whether steps/sec fall depends on whether pad used to participate in the FFN. A sample that already fills 2048 gets nothing from packing. Accept on response tokens per second and a cross-sample leakage probe, not on optimizer steps per second.
+
+## TRAIN-034. The same SFT config moves from "batch 16 on one GPU" to "micro-batch 4 × gradient accumulation 4". Samples are variable-length conversations with loss only on response tokens, and now neither the loss curve nor downstream scores match. Why is "take a token mean inside each micro-batch, then average over the 4 accumulation steps" not the token mean of the big batch? How large is the error, which way does it push the model, and what should the denominator be under 8-GPU DDP?
+
+**Answer:** The intended objective is the average loss over all non-ignored tokens in the accumulation window: L = Σ_j ℓ_j / N, where N is the number of response tokens in the window. The common code computes Σ_{j∈i} ℓ_j / n_i per micro-batch, divides by the number of accumulation steps G, and adds up; that gives each token in micro-batch i a weight of 1/(G·n_i), while the correct weight is 1/N. The two agree only when every n_i is equal. Example: four micro-batches with 1200, 300, 80, and 420 response tokens, N = 2000, G = 4. The correct weight is 1/2000; under the naive code the four groups get 0.417, 1.667, 6.25, and 1.19 times the correct weight, so one token in the 80 group counts as much as 15 tokens in the 1200 group. The error is not only a scale: the gradient direction changes too. Samples with short responses are amplified, the model is pushed toward short-response behavior, and the loss curve jitters with each step's length mix. The fix is to count the total non-ignored tokens N in the window (and across all GPUs) first, have each micro-batch backpropagate Σ ℓ_j / N, and then the gradient after G steps is identical to eating the whole window at once. DDP averages over W GPUs in the all-reduce by default, so if every GPU divides by the global N you must also multiply by W (or divide by N/W on each GPU), or the gradient is W times too small.
+
+**Deep dive:** Run the equivalence instead of arguing it. The code below uses a linear model with one squared loss per token and compares three versions:
+
+```python
+import numpy as np
+rng = np.random.default_rng(1)
+counts = [1200, 300, 80, 420]              # non-ignored tokens per micro-batch
+X = [rng.standard_normal((n, 4)) for n in counts]
+Y = [rng.standard_normal(n) for n in counts]
+w = np.zeros(4)
+def grad_sum(x, y):                         # d/dw of sum over tokens of 0.5*(x@w - y)^2
+    return x.T @ (x @ w - y)
+N = sum(counts)
+full = grad_sum(np.vstack(X), np.concatenate(Y)) / N        # one big batch, token mean
+naive = sum(grad_sum(x, y) / len(y) for x, y in zip(X, Y)) / len(counts)
+fixed = sum(grad_sum(x, y) / N for x, y in zip(X, Y))       # divide by window total
+assert np.allclose(fixed, full)
+assert not np.allclose(naive, full)
+cos = naive @ full / np.linalg.norm(naive) / np.linalg.norm(full)
+print("naive vs full cosine", round(float(cos), 4))
+```
+
+In this fixed-seed toy, the cosine between the naive gradient and the full-batch gradient is only about 0.59: it is not "the learning rate is off by a factor"; it is walking in another direction. In real SFT a micro-batch's n_i depends on how long those conversations' responses are, and a several-fold spread is common. Packing into full rows only makes total tokens similar; the share of ignored prompt tokens still varies, so n_i still differ.
+
+When the naive code happens to be right: fixed-length pretraining rows with loss at every position give every micro-batch the same n_i. That is why the same code looks fine in pretraining and only breaks on SFT or preference data with loss on responses only. In 2024 an open-source training library shipped a widely discussed fix for exactly this, and the symptom was "loss is higher with gradient accumulation than without, and more so with longer accumulation."
+
+Three engineering changes. First, the denominator must be known in advance: before the forward pass of the window's first micro-batch, pull the labels of all G micro-batches and count non-ignored tokens; on multiple GPUs, all-reduce that integer (one scalar, negligible cost). Second, accumulate loss sums in fp32 so long sums do not lose precision in bf16. Third, log loss as Σ(loss sums) / Σ(token counts), not a mean of micro-batch means, or the curve itself lies.
+
+One separate choice must also be explicit: per-token or per-sample averaging. Per-sample averaging takes a mean inside each conversation and then averages across samples, so every conversation weighs the same and a single token in a long response weighs less. Either can be a reasonable objective, but it must be the same objective with and without accumulation and multi-GPU. Acceptance is direct: same data, same initial weights, run one step as batch 16 and one step as 4×4 accumulation, and compare the gradients (or updated weights); the difference should be at numerical-noise level.
+
+Gradient clipping happens once, after accumulation and the all-reduce, on the full gradient. After you change normalization the gradient-norm scale may differ from before, so revisit the clipping threshold instead of copying the old config.
+
+**Follow-ups:** The window's token count has to be known in advance; what do you do when the data loader is streaming and cannot see the later micro-batches? How must per-sample averaging be written to stay equivalent under accumulation and multi-GPU? Do sequence-pair objectives such as DPO have the same class of problem?
+
+**Extended questions:**
+- With groups of 1200, 300, 80, and 420, write each token's weight under the naive code, window-total normalization, and per-sample averaging.
+- With 8-GPU DDP and 4 accumulation steps per GPU, write the number each GPU's loss should be divided by, and explain how DDP's gradient averaging changes it.
+- With only logs and no code access, how would two short experiments tell you whether a training framework has this bug?
+
+**Reasoning:** The objective comes before the implementation: first write down that you want the average loss over all response tokens in the window, then check the actual weight each code path gives every token. The naive weight varies with the token count inside each micro-batch and matches the objective only when all n_i are equal, so the problem shows up only on variable-length data with ignored labels. The fix replaces the denominator with the token total across the whole window and all GPUs, plus the factor W from DDP averaging. Accept on "one accumulated step equals one non-accumulated step," not on whether the loss curve looks nice.

@@ -716,3 +716,61 @@ Gloeckle et al. (2024) Multi-Token Prediction uses a shared trunk whose n predic
 - If you deploy only head 1, where do drafts come from; if you append head 4's sample directly into the context, which training conditional did you replace?
 
 **Reasoning:** The goal is extra supervision from real future tokens, plus optional draft heads, while the autoregressive factorization you ship stays the same. The constraints are causal teacher forcing and memory that grows linearly with n in logits and optimizer state. Share the trunk, read h_t from every head, and put cross-entropy on x_{t+k}. Sample only head 1 at decode; treat every other output as an unverified proposal. Choose n from head 1's held-out perplexity and the three-row memory sheet (Adam, logits, weights). Count independent heads as n·d·V·2 bytes, compare that to optimizer state, then decide whether to share one LM head and add small adapters.
+
+## ARCH-047. Long-context serving memory is almost entirely KV cache. DeepSeek-V2 (2024) uses Multi-head Latent Attention (MLA), which caches only a low-rank latent vector plus a small positional key per layer. With its published configuration (128 heads, 128 dims per head, 512-dim latent, 64-dim decoupled RoPE key, 60 layers), how many times smaller is the per-token cache than standard MHA, and how many GQA groups is that equivalent to? Why can the key and value up-projections be folded into the query and output projections at inference, and why does RoPE force a separate positional branch?
+
+**Answer:** MLA first compresses the hidden state h_t into a latent c_t = W_DKV·h_t (512 dims); each head's key and value are up-projected from it: k_i = W_UK,i·c_t, v_i = W_UV,i·c_t. The cache stores only c_t plus a 64-dim key k_t^R that is shared by all heads and carries RoPE separately. Cached elements per layer per token: MHA has 2×128×128 = 32,768, MLA has 512+64 = 576, about 56.9× smaller; in GQA terms 576/(2×128) = 2.25, i.e. the same cache as GQA with only 2.25 groups. In bf16 across 60 layers: MHA is 3,932,160 bytes per token (3.75 MiB), MLA 69,120 bytes (67.5 KiB); one 131,072-token sequence needs 480 GiB under MHA and about 8.44 GiB under MLA. The saving relies on absorption: the score q_i·k_i = (W_Q,i·h_t)ᵀ(W_UK,i·c_s) = (W_UK,iᵀ·W_Q,i·h_t)ᵀ·c_s, and W_UK,iᵀ·W_Q,i is a constant you multiply once, so the query dots directly against cached latents without rebuilding full keys for past tokens; on the value side W_UV,i is folded into the output projection W_O. RoPE breaks this associativity: if the rotation acts on the up-projected key, the score contains R(t)ᵀR(s), which changes with the position offset, so no fixed absorbed matrix exists. DeepSeek-V2 keeps the content part position-free and carries RoPE only in extra 64-dim q^R and k^R; the two dot products are added before the softmax.
+
+**Deep dive:** Put the ledger in a table first.
+
+| Scheme | Elements per layer per token | bf16, 60 layers, per token | One 131,072-token sequence |
+|---|---:|---:|---:|
+| MHA (128 heads × 128 dims, K+V) | 32,768 | 3,932,160 B = 3.75 MiB | 480 GiB |
+| GQA, 8 groups | 2,048 | 245,760 B = 240 KiB | 30 GiB |
+| MLA (512 + 64) | 576 | 69,120 B = 67.5 KiB | 8.4375 GiB |
+
+GQA with 8 groups is still 2048/576 ≈ 3.56× larger than MLA. What you save is not parameters but bytes that every generated token must read from HBM: decode is bandwidth-bound, so a smaller KV lets the same bandwidth carry a larger batch and longer context.
+
+Absorption is a linear-algebra fact you can check on the spot, and so is RoPE breaking it:
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+d, dc, dh = 64, 16, 8                      # toy sizes: model, latent, head
+W_Q  = rng.standard_normal((dh, d))        # query projection of one head
+W_DKV = rng.standard_normal((dc, d))       # shared down-projection -> cached latent c
+W_UK = rng.standard_normal((dh, dc))       # per-head key up-projection
+h_t, h_s = rng.standard_normal(d), rng.standard_normal(d)
+c_s = W_DKV @ h_s                          # only this (dc numbers) is cached
+explicit = (W_Q @ h_t) @ (W_UK @ c_s)      # rebuild key, then dot
+W_absorb = W_UK.T @ W_Q                    # (dc, d), precomputed once
+absorbed = (W_absorb @ h_t) @ c_s          # dot directly against the latent
+assert np.isclose(explicit, absorbed)
+
+def rot(pos, n=dh, base=10000.0):          # RoPE as a block-diagonal rotation
+    R = np.zeros((n, n))
+    for i in range(n // 2):
+        a = pos * base ** (-2 * i / n)
+        R[2*i:2*i+2, 2*i:2*i+2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
+    return R
+# with RoPE on the up-projected key, the middle matrix depends on the offset
+M = lambda t, s: W_Q.T @ rot(t).T @ rot(s) @ W_UK
+assert np.allclose(M(5, 3), M(9, 7))        # same offset: same matrix
+assert not np.allclose(M(5, 3), M(5, 1))    # different offset: no single W_absorb
+print("ok")
+```
+
+After decoupling, the positional key k_t^R is projected straight from h_t and rotated, and one copy is shared by all heads, so only 64 extra dims are cached; each head has its own q^R. The content branch is never rotated, so absorption still holds. The cost is that position flows only through a 64-dim channel and the content branch itself is position-insensitive; that is a deliberate trade, not a defect.
+
+The absorbed decode path looks a lot like MQA: 128 heads read the same 576-dim cache, and each head's query is first mapped into the 512-dim latent space. More multiply-adds happen per byte of KV read, so arithmetic intensity rises and the bandwidth bottleneck eases; but each head's dot product grows from 128+64 to 512+64 dims, so FLOPs go up. A common implementation therefore keeps two paths: prefill is already compute-bound, so it explicitly up-projects per-head K and V and uses an ordinary attention kernel; decode is bandwidth-bound, so it runs the absorbed latent path. DeepSeek-V2 also compresses the query side with a low-rank projection; that saves training activations and has nothing to do with the KV cache, so keep it out of the cache ledger.
+
+Edge conditions: MLA is a structure fixed at training time. An already trained MHA checkpoint cannot be turned into MLA by offline matrix factorization without losing quality; at minimum it needs continued training and re-evaluation. Caching the latent also does not mean you can quantize it freely: c_t carries keys and values for every head at once, so quantization error is amplified by all 128 up-projections, and FP8-style KV quantization needs its own long-context evaluation.
+
+**Follow-ups:** Why not simply apply RoPE to the latent c_t? The positional branch is only 64 dims; which part do long-context extension tricks (YaRN-style scaling) act on? On the absorbed decode path, how many more FLOPs does one head spend than on the explicit path, and at what batch size does that trade stop paying?
+
+**Extended questions:**
+- Using the table: with 40 GiB left for KV on an 80 GiB card after weights, how many 32k-token sessions fit under MHA, GQA with 8 groups, and MLA?
+- Explain why k^R can be shared by all heads while q^R must be per head; if k^R were per head too, how big would the cache become?
+- To save memory by converting an existing GQA model to MLA, how would you design continued training and acceptance, and which long-context metrics expose problems first?
+
+**Reasoning:** The goal is to minimize the KV bytes read in each decode step without collapsing attention into MQA, where every head shares one K and V. The path is to change what is cached from per-head K and V to one low-rank latent shared by all heads, then use matrix associativity to move the up-projections onto the query and output side, so the cache really holds only 576 numbers. RoPE makes the middle matrix depend on the position offset and breaks associativity, so position must travel on a narrow branch that is not absorbed. For acceptance, look at three things together: cache bytes per token, decode throughput, and long-context quality; do not report the 56.9× compression ratio alone.
