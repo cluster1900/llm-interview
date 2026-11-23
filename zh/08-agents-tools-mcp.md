@@ -836,3 +836,39 @@ state = {
 - 轨迹里的中间思考可能含用户数据，留存和评测标注怎样分层？
 
 **推理回答：** 目标是评价闭环行为，不只是最终字符串。约束是可复现、安全和成本。先规定轨迹字段和分项指标，再让安全做独立门槛。用分项回归而不是单一总分决定上线。
+
+## AGENT-058. 客服助手在同一轮 assistant 消息里一次发出三个 tool_call：get_order 的 p95 是 120ms，get_user 是 80ms，get_inventory 是 200ms，三个都是只读查询。运行时是串行执行还是可以并行，墙钟分别是多少？若 get_inventory 返回 500、另两个已经成功，能不能把 get_order 再打一遍？同一轮里若出现 refund 和 send_email 两个有副作用的调用，默认策略是什么？要把观察交回模型，消息里必须带上什么字段？
+
+**答：** 三个都是只读、互不依赖时，运行时应在这一轮里并行发出，墙钟取 p95 的最大值 200ms，而不是串行相加的 400ms；这是同一条 assistant 消息里多个 tool_call 的执行策略，不是再规划下一轮该不该扇出。get_inventory 失败时，已经成功的 get_order 和 get_user 不得重放，只把这两份观察和一份结构化的库存错误一齐交回模型，由模型决定是否只重试库存。refund 与 send_email 即使被模型写在同一轮，默认也要串行，并且按声明顺序（或按显式依赖）执行：两者都有副作用，并行或乱序可能先发「已退款」邮件再退款失败，或把一笔退款执行两次。交回模型的每条 tool 消息必须带上与发出时一致的 tool_call_id，角色是 tool，内容是该次调用的观察或错误；缺 id 时模型无法把结果和三个调用对齐，成功的那两份观察也会废掉。
+
+**深入展开：** 协议是一拍：一条 assistant 消息带 tool_calls[]（每项有 id、name、arguments），运行时按策略执行完这一批，再追加同样数量的 tool 消息，然后才允许下一轮模型调用。只读且无依赖的调用可以并行；只要有一个写操作，或两个调用的参数互相引用，整批降级为串行，或只并行其中标记为只读的子集。延迟账按「这一批的墙钟 = 可并行子集的 max + 必须串行的和」来写：上面三个只读是 200ms；若再加一个必须等库存结果才能发的 refund，墙钟至少是 200ms+退款耗时，不能把退款和库存一齐发出。部分失败的契约是「成功的副作用绝不再发，成功的只读结果要保留」：get_order 虽是只读，重放也浪费配额、还可能和并发工单对不上快照，所以默认不重放；把三个结果（两个 OK、一个错误对象，含 HTTP 状态和可重试标记）完整交给模型。不要在运行时悄悄用旧缓存填库存——那会让模型以为这一拍库存是真的。副作用工具要在 schema 里标 write / idempotent，运行时只相信这张表，不相信模型在思考文本里写的「我只是查一下」。同一轮发出两个 refund、id 不同但参数相同，必须靠幂等键去重，不能当两个独立写。验收看三件事：只读批的墙钟是否接近最慢的那一个、部分失败后成功写是否仍是一次、以及缺少 tool_call_id 时是否拒绝组下一条模型请求。
+
+```python
+p95 = {"get_order": 120, "get_user": 80, "get_inventory": 200}
+readonly = ("get_order", "get_user", "get_inventory")
+serial_ms = sum(p95[n] for n in readonly)
+parallel_ms = max(p95[n] for n in readonly)
+assert serial_ms == 400 and parallel_ms == 200
+# one write that depends on inventory cannot join the parallel set
+refund_ms = 150
+with_refund_serial = parallel_ms + refund_ms
+assert with_refund_serial == 350
+assert with_refund_serial < (serial_ms + refund_ms)
+# partial failure: do not replay the successes
+results = {
+    "call_order": {"ok": True, "replay": False},
+    "call_user": {"ok": True, "replay": False},
+    "call_inventory": {"ok": False, "replay": True},
+}
+assert all(v["replay"] is False for k, v in results.items() if v["ok"])
+assert results["call_inventory"]["replay"] is True
+```
+
+**后续追问：** 三个只读里 get_user 要拿 get_order 返回的 user_id，还能不能整批并行？send_email 标了幂等、refund 没有，同一轮失败重试时谁可以再发？流式前端已经把「正在退款」画到屏幕上，库存 500 之后你怎样改口，才不会让用户以为款已经退了？
+
+**扩展问题：**
+- 写出这一拍的消息序列：assistant.tool_calls、三条 tool 消息、以及部分失败时错误对象最少要有哪些字段。
+- 8 个互相独立的只读工具、每个 p95 为 300ms，串行与并行的墙钟各是多少；若其中 2 个其实写库，运行时要怎样自动降级？
+- 如何用「成功写操作的实际执行次数 / 模型发出次数」证明部分失败路径没有重放副作用？
+
+**推理回答：** 目标是把同一轮多个 tool_call 的墙钟压到最慢的那次只读调用，同时保证副作用最多执行一次。约束是依赖和写操作不能默并行，部分失败时成功结果必须保留，模型靠 tool_call_id 对齐观察。只读无依赖则并行，写则串行并按幂等键去重，失败只重试被标记为可重试的那一次。验收看批墙钟、写操作次数和 id 对齐，而不是看模型有没有在同一轮里「一起说出来」。

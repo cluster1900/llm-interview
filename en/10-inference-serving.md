@@ -850,3 +850,45 @@
 - When the budget is gone, do you refuse S3, move S3 to an offline queue, or add replicas—and which SLO does each choice hurt?
 
 **Reasoning:** Short chats that slow down must page; healthy long prefills must not flood the board. TTFT tracks input length, so a mixed p99 has no explanatory power. Bucket SLOs on input tokens; keep error budget and burn rate per bucket. Accept when the short bucket stays quiet if only long calls worsen, and when a real short-chat regression pages inside the fast-burn window.
+
+## SERVE-062. You are deploying a model with the published Mixtral 8×7B (Mistral, 2023) widths: 32 layers, d_model=4096, GQA with 32 query heads and 8 KV heads (head dim 128), 8 experts per layer, top-2 routing, three 4096×14336 SwiGLU matrices per expert, vocabulary 32,000 with the embedding and LM head untied. Do the bf16 weights fit on one 80 GiB card? Active parameters are only about 13B—can you size memory as if this were a 13B dense model? With expert parallelism 8 and the dense part replicated on every rank, about how many GiB of weights does each card hold, and how many all-to-all bytes move in a decode step at batch=16 versus a 4096-token prefill? If one expert is chosen by 40% of tokens, how many times the uniform load is that?
+
+**Answer:** Add the parameters from the widths; do not use the slogan “8×7B=56B.” Attention is 41,943,040 weights per layer, one expert is 3×4096×14336=176,160,768, eight experts are 1,409,286,144, and with the router, RMSNorm, and two vocabulary matrices the total is 46,702,792,704 parameters. In bf16 that is 93,405,585,408 bytes = 93,405,585,408/2³⁰ GiB, i.e. 86.990730285644531 GiB, which overshoots an 80 GiB card by 7,506,239,488 bytes (6.990730285644531 GiB). A single card cannot hold the bf16 weights. With two experts active per token, the active count is 12,879,925,248 parameters, about 23.990730285644531 GiB in bf16—that figure is only a “compute/bandwidth on the order of 13B” estimate. All eight experts’ weights must stay resident, so memory is a 46.7B bill, not a 13B dense card order. Under expert parallelism 8, each card replicates the dense part (1,605,636,096 parameters) and keeps 1/8 of the experts, i.e. 7,242,780,672 parameters, 14,485,561,344 bytes of bf16 = 13.490730285644531 GiB, which leaves room for KV and activations on an 80 GiB card. All-to-all is “each token sends and gets back two 4096-wide bf16 vectors”: at decode batch=16 that is 262,144 bytes (256 KiB) one way and 512 KiB round-trip; a 4096-token prefill is 64 MiB one way and 128 MiB round-trip. Under uniform top-2, each expert is expected to be chosen by 25% of tokens; if one expert is chosen by 40%, that rank’s expert GEMM sees 1.6× the uniform token count, and TPOT for the step is nailed by the slowest card.
+
+**Deep dive:** Split the parameter bill into dense and expert lines. Dense (both vocabulary matrices, all attention, routers, RMSNorm) is 1,605,636,096; all experts are 45,097,156,608, about 96.6% of the total. If you only quantize weights, the whole fp8 book is 46,702,792,704 bytes = 43.495365142822266 GiB, so the weights fit on one card, but KV and runtime still need their own line; saying “fp8 fits on one card” is not the same as “buy a 24 GB card as if it were 13B.” Expert parallelism solves “46.7B does not fit,” not “the 13B compute graph got smaller.” After routing, hidden states go to the card that holds the chosen expert, and expert outputs come back. The vector width is d_model, not d_ff, because the expert’s input and output are hidden states. With only tens of tokens in a decode step, 512 KiB of traffic is often not the first wall; the hard part is uneven expert kernels across eight cards, with ranks that own idle experts still waiting at the sync point. That is the same family of effect as “why a 400B-class MoE can be slower than a dense model with the same active count,” but this question asks for capacity and bytes, not a wall-clock comparison with 13B dense. Prefill has thousands of tokens, a 128 MiB round-trip, and much larger expert GEMMs, so utilization is closer to training and EP is easier to saturate. Measure imbalance by the fraction of tokens that select an expert, not by request count: uniform is 2/8=25%; 40% is 1.6×, not 40/12.5=3.2× (that mistake treats top-2 as if it were top-1 with share 1/8). Online, hot experts drift with the tenant mix, so capacity has to be planned against the hot-expert peak, not the average. In the DeepSeek-V2 / V3 (2024) style with a shared expert that every token always runs, that shared expert stays local and does not enter all-to-all, which can cut some variance—but the full weight set still has to be resident. Do not collapse resident, active, and per-card sharded counts into one number.
+
+```python
+L, d, V, d_ff = 32, 4096, 32000, 14336
+n_kv, n_exp, topk = 8, 8, 2
+attn = d * (d + 2 * n_kv * 128 + d)
+expert = 3 * d * d_ff
+dense = 2 * V * d + d + L * (attn + d * n_exp + 2 * d)
+total = dense + L * n_exp * expert
+active = dense + L * topk * expert
+assert attn == 41_943_040 and expert == 176_160_768
+assert total == 46_702_792_704 and active == 12_879_925_248
+assert dense == 1_605_636_096
+bf16_total = total * 2
+assert bf16_total == 93_405_585_408
+assert bf16_total / 2**30 == 86.990730285644531
+assert bf16_total - 80 * 2**30 == 7_506_239_488
+per_rank = dense + L * expert
+assert per_rank == 7_242_780_672
+assert per_rank * 2 / 2**30 == 13.490730285644531
+# all-to-all: B tokens, k vectors of d bf16 both ways
+B = 16
+one_way = B * topk * d * 2
+assert one_way == 262_144 and 2 * one_way == 524_288
+prefill_one_way = 4096 * topk * d * 2
+assert prefill_one_way == 67_108_864  # 64 MiB
+assert 0.40 / 0.25 == 1.6
+```
+
+**Follow-ups:** If attention is also split with tensor parallelism and no longer replicated per card, which line drops from the per-card weight bill, and which collective is added on top of all-to-all? If decode batch goes from 16 to 128, does the 1.6× hot-expert wall-clock grow linearly or hit a different roof? If you also shard KV across the expert-parallel devices, what goes wrong?
+
+**Extended questions:**
+- Write the three lines “resident / active / per-card shard” and explain why a 24 GB card can hold the active-parameter budget but not the serving working set.
+- If routing becomes top-1, what are the uniform share and the 40% hot-expert multiplier, and how do the all-to-all bytes change?
+- If the same weights are stored in fp8 on a single card with no EP, which decode degradation do you still worry about, and what do you measure?
+
+**Reasoning:** The goal is to get MoE serving memory and interconnect right, not to analogize from the active-parameter count to a dense model. All experts must be resident; communication and synchronization follow the chosen experts’ locations; TPOT tracks the slowest expert rank. Sum parameters from the published widths, report the full, active, and EP-shard bills, get all-to-all as tokens × 2 × k × d × 2 bytes, and measure hot experts by selection share rather than request count. Accept when a card actually holds the working set plus KV, and when TPOT at the hot-expert peak is in budget—not when a “~13B” marketing line looks cheap.

@@ -836,3 +836,39 @@ state = {
 - Intermediate thoughts may contain user data. How do you tier retention versus eval labeling?
 
 **Reasoning:** The goal is to judge closed-loop behavior, not the final string. Constraints are replay, safety, and cost. Specify trace fields and component metrics, then keep safety as an independent gate. Ship on component regressions, not one blended score.
+
+## AGENT-058. In a single assistant message, a support agent emits three tool_calls: get_order at p95=120ms, get_user at 80ms, and get_inventory at 200ms, all read-only lookups. Should the runtime run them serially or in parallel, and what is the wall-clock in each case? If get_inventory returns 500 and the other two have already succeeded, may you fire get_order again? If the same turn also contains refund and send_email, both with side effects, what is the default policy? And when you hand observations back to the model, which field must each tool message carry?
+
+**Answer:** When the three calls are read-only and independent, the runtime should fire them in parallel in this turn; wall-clock is the max p95, 200ms, not the serial sum of 400ms. That is the execution policy for multiple tool_calls in one assistant message, not a question about whether the next turn’s plan should fan out. If get_inventory fails, do not replay the get_order and get_user calls that already succeeded; hand both observations back together with one structured inventory error, and let the model decide whether to retry inventory only. Even if the model wrote refund and send_email in the same turn, the default is to run them serially, in declaration order (or in an explicit dependency order): both have side effects, and parallel or out-of-order execution can send a “refunded” email before the refund fails, or apply the refund twice. Each tool message back to the model must carry the same tool_call_id that was issued, with role tool and a body that is that call’s observation or error. Without the id, the model cannot align results to the three calls, and the two successful observations are wasted as well.
+
+**Deep dive:** The protocol is one beat: one assistant message with tool_calls[] (each entry has id, name, arguments), the runtime finishes this batch under the policy, then appends the same number of tool messages, and only then may the next model call run. Read-only calls with no dependency may run in parallel; if any call is a write, or if two calls’ arguments refer to each other, the batch falls back to serial—or only the subset marked read-only stays parallel. Write the latency bill as “wall-clock of this batch = max of the parallelizable subset + sum of the must-serial tail.” The three reads above are 200ms; if you then add a refund that must wait on the inventory result, wall-clock is at least 200ms plus the refund time, and you must not fire refund together with inventory. The partial-failure contract is “successful side effects are never resent, and successful read results are kept.” get_order is read-only, but replaying it still burns quota and may disagree with a concurrent ticket’s snapshot, so the default is no replay; give the model all three results (two OKs and one error object, including the HTTP status and a retryable flag). Do not silently fill inventory from an old cache in the runtime—that would make the model believe this beat’s inventory is real. Side-effect tools must be marked write / idempotent in the schema; the runtime trusts that table, not a “I’m only looking” line in the model’s chain of thought. If the same turn emits two refunds with different ids but identical arguments, you must deduplicate on an idempotency key, not treat them as two independent writes. Acceptance looks at three things: whether a read-only batch’s wall-clock is close to the slowest call, whether a successful write is still executed once after a partial failure, and whether a missing tool_call_id causes the next model request to be refused.
+
+```python
+p95 = {"get_order": 120, "get_user": 80, "get_inventory": 200}
+readonly = ("get_order", "get_user", "get_inventory")
+serial_ms = sum(p95[n] for n in readonly)
+parallel_ms = max(p95[n] for n in readonly)
+assert serial_ms == 400 and parallel_ms == 200
+# one write that depends on inventory cannot join the parallel set
+refund_ms = 150
+with_refund_serial = parallel_ms + refund_ms
+assert with_refund_serial == 350
+assert with_refund_serial < (serial_ms + refund_ms)
+# partial failure: do not replay the successes
+results = {
+    "call_order": {"ok": True, "replay": False},
+    "call_user": {"ok": True, "replay": False},
+    "call_inventory": {"ok": False, "replay": True},
+}
+assert all(v["replay"] is False for k, v in results.items() if v["ok"])
+assert results["call_inventory"]["replay"] is True
+```
+
+**Follow-ups:** If get_user needs the user_id returned by get_order, can the three reads still run fully in parallel? send_email is marked idempotent and refund is not—after a failed turn, which one may be resent? The streaming UI has already painted “refunding” on the screen; after inventory returns 500, how do you retract that so the user does not believe the money has already moved?
+
+**Extended questions:**
+- Write the message sequence for this beat: assistant.tool_calls, the three tool messages, and the minimum fields of the error object on a partial failure.
+- For eight independent read-only tools at p95=300ms each, what are the serial and parallel wall-clocks? If two of them actually write to the database, how should the runtime automatically fall back?
+- How would you use “actual executions of successful writes / times the model emitted them” to prove the partial-failure path did not replay a side effect?
+
+**Reasoning:** The goal is to drive same-turn multi-tool_call wall-clock down to the slowest read, while a side effect still runs at most once. Writes and dependencies must not default to parallel; successful results must be kept on partial failure; the model aligns observations by tool_call_id. Parallelize independent reads, serialize writes and deduplicate them on an idempotency key, and retry only the call marked retryable. Accept on batch wall-clock, write counts, and id alignment—not on whether the model happened to name the three tools in one turn.

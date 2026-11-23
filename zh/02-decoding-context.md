@@ -385,3 +385,68 @@
 - 如何在日志里打话题边界，方便离线统计多轮鲁棒性？
 
 **推理回答：** 任务型槽位带副作用，填错会打到退货接口，所以必须先判断本句是不是给当前任务的槽，再决定挂起还是填充。检测可以廉价，恢复必须显式。用错误工具参数率和任务完成率验收，而不是单轮是否说得流畅。
+
+## GEN-029. 解码改用 min-p（2024）：先按温度做 softmax 得到 p，取 p_max，丢掉所有 p < min_p·p_max 的 token，再在留下的集合上重新归一化抽样。设 min_p=0.1。同一组 logits [3.0, 1.2, 0.4, 0.3, 0.2, 0.1, −1.0, −2.0] 在 T=0.7、1.0、1.5 时，min-p 的阈值怎样随 p_max 变，各留下几项？对照固定 top-p=0.9（累计质量含越线项）的保留项数，说明温度升高时为什么是 min-p 的截断在自动放松。再对已归一化的 [0.88, 0.05, 0.03, 0.02, 0.01, 0.01] 与 [0.20, 0.16, 0.14, 0.12, 0.10, 0.08, 0.07, 0.06, 0.04, 0.03] 算出阈值与保留质量，并说明这和「把 top-p 的 p 改成 0.1」不是同一条规则。
+
+**答：** 阈值是 min_p·p_max，跟着当前步最峰的那个质量走，不是一个全局的累计核。对这组 logits，min_p=0.1：T=0.7 时 p_max≈0.8619，阈值约 0.0862，只留下第 1 项；T=1.0 时 p_max≈0.6908，阈值约 0.0691，留下 2 项；T=1.5 时 p_max≈0.4884，阈值约 0.0488，留下 6 项。同一组上固定 top-p=0.9 留下的是 2、4、6 项。温度升高把分布打平、p_max 下降，min-p 的门槛一起下降，截断自动放松；固定核的 p 仍是 0.9，不会因为 p_max 变了就改自己的尺子。两个已归一化的例子只用来把阈值算具体：尖的一侧 p_max=0.88，阈值 0.088，0.05 已在线下，只留 0.88；平的一侧 p_max=0.20，阈值 0.02，十个质量都 ≥0.03，全部留下。把 top-p 的 p 改成 0.1 是在卡累计质量，和「0.1 去乘 p_max」不是同一条规则。截断之后必须在保留集合上重新归一化再抽样。固定 top-k / top-p 在尖步与平步上会误纳或误删，已在 GEN-002，本题不展开；核要不要留下越线 token、并列与数值稳定，是 CODE-008 的实现题。
+
+**深入展开：** 实现顺序是：先除温度并做数值稳定的 softmax，再算 p_max 与阈值，再掩码，再把保留项的质量加总后抽样。不要在除温度之前截断，否则 p_max 还不是抽样用的那一个。调 min_p 常见从 0.05 扫到 0.1、0.2：过大时即使分布已经打平也只剩主峰，过小则几乎等于不截。它不替代温度，也不替代停用或频率惩罚；重复循环要另看那些规则。验收不要只看开放域是否「更有创意」，要同时看 T>1 时 JSON 或工具调用是否还能抽到合法键。把 min-p 打开却把失败全归给温度，会调错开关。上面的温度对照已经显示：低 T 时 min-p 比固定 top-p=0.9 更狠（1 项对 2 项），高 T 时两者可以一样宽（都是 6 项）——这正是「门槛随 p_max 走」要换来的性质。
+
+```python
+import math
+
+def softmax(logits, T):
+    z = [x / T for x in logits]
+    m = max(z)
+    exps = [math.exp(x - m) for x in z]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+def minp_kept(p, min_p=0.1):
+    cutoff = min_p * max(p)
+    kept = [i for i, pi in enumerate(p) if pi >= cutoff]
+    return kept, cutoff
+
+def nucleus_kept(p, p_nuc=0.9):
+    order = sorted(range(len(p)), key=lambda i: -p[i])
+    acc, kept = 0.0, []
+    for i in order:
+        kept.append(i)
+        acc += p[i]
+        if acc >= p_nuc:
+            break
+    return kept, acc
+
+logits = [3.0, 1.2, 0.4, 0.3, 0.2, 0.1, -1.0, -2.0]
+counts = {}
+for T in (0.7, 1.0, 1.5):
+    p = softmax(logits, T)
+    counts[T] = (len(nucleus_kept(p)[0]), len(minp_kept(p)[0]), max(p), minp_kept(p)[1])
+assert counts[0.7][0] == 2 and counts[0.7][1] == 1
+assert counts[1.0][0] == 4 and counts[1.0][1] == 2
+assert counts[1.5][0] == 6 and counts[1.5][1] == 6
+assert abs(counts[0.7][2] - 0.8619133244149361) < 1e-12
+assert abs(counts[0.7][3] - 0.08619133244149361) < 1e-12
+
+sharp = [0.88, 0.05, 0.03, 0.02, 0.01, 0.01]
+kept_n, acc = nucleus_kept(sharp)
+kept_m, cutoff = minp_kept(sharp)
+assert kept_n == [0, 1] and abs(acc - 0.93) < 1e-12
+assert kept_m == [0] and abs(cutoff - 0.088) < 1e-12
+
+flat = [0.20, 0.16, 0.14, 0.12, 0.10, 0.08, 0.07, 0.06, 0.04, 0.03]
+assert abs(sum(flat) - 1.0) < 1e-12
+kept_n, acc = nucleus_kept(flat)
+kept_m, cutoff = minp_kept(flat)
+assert kept_n == list(range(8)) and abs(acc - 0.93) < 1e-12
+assert kept_m == list(range(10)) and abs(cutoff - 0.02) < 1e-12
+```
+
+**后续追问：** min_p 从 0.1 提到 0.5，平坦那组还会留下几个质量？T=0 时 p_max=1，min-p 还有没有作用？若先做 min-p 再做 top-p，和相反次序留下的集合会不会不同？
+
+**扩展问题：**
+- 写出阈值公式，并说明为什么「把 top-p 的 p 改成 min_p」得不到同一集合。
+- 在同一组 logits 上列出 T=0.7 / 1.0 / 1.5 时两种截断各保留几项，指出哪一侧的门槛在随 p_max 下降。
+- 若工具 JSON 在 T=1.2、min_p=0.05 时开始出现非法键，你先降温度、提高 min_p，还是加文法约束？
+
+**推理回答：** 目标是让截断门槛跟着当前步的 p_max 走，从而在升温、分布变平时自动放松，而不是再调一个固定核。约束是阈值乘的是 p_max、截断发生在 softmax 之后，并且截完要重新归一化。用同一组 logits 的温度对照验收这项自适应性，再用两个归一化例子把阈值算死。开放生成的多样性与约束输出的合法率要一起看，不要只调一个开关。
