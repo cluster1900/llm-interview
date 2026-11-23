@@ -385,3 +385,68 @@
 - How do you mark topic boundaries in logs so multi-turn robustness can be measured offline?
 
 **Reasoning:** Task slots have side effects—a bad fill hits the return API—so you must decide whether this sentence is for the current slot before you fill or suspend. Detection can be cheap; resume must be explicit. Accept on wrong-tool-argument rate and task completion, not on whether a single turn sounds fluent.
+
+## GEN-029. You switch decoding to min-p (2024): softmax the logits at a temperature to get p, take p_max, drop every token with p < min_p·p_max, then renormalize on the kept set and sample. Let min_p=0.1. On the same logits [3.0, 1.2, 0.4, 0.3, 0.2, 0.1, −1.0, −2.0] at T=0.7, 1.0, and 1.5, how does the min-p threshold move with p_max, and how many items remain? Compare the kept counts with a fixed top-p=0.9 (the cumulative mass includes the crossing item) and explain why it is min-p’s cutoff that loosens automatically when the temperature rises. Then, on the already-normalized distributions [0.88, 0.05, 0.03, 0.02, 0.01, 0.01] and [0.20, 0.16, 0.14, 0.12, 0.10, 0.08, 0.07, 0.06, 0.04, 0.03], compute the threshold and the kept masses, and show that this is not the same rule as “run top-p with p set to 0.1.”
+
+**Answer:** The threshold is min_p·p_max. It tracks the largest mass on this step, not a global cumulative nucleus. With min_p=0.1 on these logits: at T=0.7, p_max≈0.8619, the threshold is about 0.0862, and only the first item remains; at T=1.0, p_max≈0.6908, the threshold is about 0.0691, and 2 items remain; at T=1.5, p_max≈0.4884, the threshold is about 0.0488, and 6 items remain. On the same vectors, fixed top-p=0.9 keeps 2, 4, and 6 items. Raising the temperature flattens the distribution and lowers p_max, so the min-p bar falls with it and the cutoff loosens by itself. A fixed nucleus still uses p=0.9 and does not retune its ruler when p_max changes. The two already-normalized examples are only there to make the threshold concrete: on the peaked side, p_max=0.88, the threshold is 0.088, 0.05 is already below it, and only 0.88 is kept; on the flat side, p_max=0.20, the threshold is 0.02, all ten masses are ≥0.03, and all of them stay. Setting top-p’s p to 0.1 caps cumulative mass; multiplying 0.1 by p_max is not the same rule. After the cut you must renormalize on the kept set before sampling. How a fixed top-k or top-p admits or drops the wrong tokens on peaked versus flat steps is GEN-002 and is not re-derived here. Whether the nucleus must keep the crossing token, and how to handle ties and overflow, is the implementation question CODE-008.
+
+**Deep dive:** The order of operations is: divide by temperature and take a numerically stable softmax, then compute p_max and the threshold, then mask, then sample after summing the kept mass. Do not truncate before the temperature, or p_max is not the one you will sample from. A common sweep for min_p is 0.05 through 0.1 and 0.2: too large, and even a flattened step collapses to the mode; too small, and you are barely truncating. It does not replace temperature, stop tokens, or a frequency penalty; loops still need those rules. Do not accept only on whether open-ended text looks “more creative”; also check whether JSON or tool calls at T>1 still recover legal keys. Turning min-p on and blaming every failure on temperature will flip the wrong switch. The temperature contrast already shows the property you are buying: at low T, min-p is stricter than fixed top-p=0.9 (1 item versus 2); at high T the two can be equally wide (both 6 items).
+
+```python
+import math
+
+def softmax(logits, T):
+    z = [x / T for x in logits]
+    m = max(z)
+    exps = [math.exp(x - m) for x in z]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+def minp_kept(p, min_p=0.1):
+    cutoff = min_p * max(p)
+    kept = [i for i, pi in enumerate(p) if pi >= cutoff]
+    return kept, cutoff
+
+def nucleus_kept(p, p_nuc=0.9):
+    order = sorted(range(len(p)), key=lambda i: -p[i])
+    acc, kept = 0.0, []
+    for i in order:
+        kept.append(i)
+        acc += p[i]
+        if acc >= p_nuc:
+            break
+    return kept, acc
+
+logits = [3.0, 1.2, 0.4, 0.3, 0.2, 0.1, -1.0, -2.0]
+counts = {}
+for T in (0.7, 1.0, 1.5):
+    p = softmax(logits, T)
+    counts[T] = (len(nucleus_kept(p)[0]), len(minp_kept(p)[0]), max(p), minp_kept(p)[1])
+assert counts[0.7][0] == 2 and counts[0.7][1] == 1
+assert counts[1.0][0] == 4 and counts[1.0][1] == 2
+assert counts[1.5][0] == 6 and counts[1.5][1] == 6
+assert abs(counts[0.7][2] - 0.8619133244149361) < 1e-12
+assert abs(counts[0.7][3] - 0.08619133244149361) < 1e-12
+
+sharp = [0.88, 0.05, 0.03, 0.02, 0.01, 0.01]
+kept_n, acc = nucleus_kept(sharp)
+kept_m, cutoff = minp_kept(sharp)
+assert kept_n == [0, 1] and abs(acc - 0.93) < 1e-12
+assert kept_m == [0] and abs(cutoff - 0.088) < 1e-12
+
+flat = [0.20, 0.16, 0.14, 0.12, 0.10, 0.08, 0.07, 0.06, 0.04, 0.03]
+assert abs(sum(flat) - 1.0) < 1e-12
+kept_n, acc = nucleus_kept(flat)
+kept_m, cutoff = minp_kept(flat)
+assert kept_n == list(range(8)) and abs(acc - 0.93) < 1e-12
+assert kept_m == list(range(10)) and abs(cutoff - 0.02) < 1e-12
+```
+
+**Follow-ups:** If you raise min_p from 0.1 to 0.5, how many masses remain on the flat set? At T=0, p_max=1—does min-p still do anything? If you run min-p and then top-p, can the opposite order leave a different set?
+
+**Extended questions:**
+- Write the threshold formula and explain why “run top-p with p set to min_p” does not yield the same set.
+- On the same logits, list how many items each truncation keeps at T=0.7 / 1.0 / 1.5, and point out which bar falls as p_max falls.
+- If tool JSON starts emitting illegal keys at T=1.2 and min_p=0.05, do you lower the temperature, raise min_p, or add a grammar constraint first?
+
+**Reasoning:** The goal is a cutoff bar that tracks this step’s p_max, so it loosens by itself when you heat the distribution, rather than retuning a fixed nucleus. The threshold multiplies p_max, truncation happens after the softmax, and the kept set must be renormalized. Accept the adaptivity on a temperature contrast of one logit vector, and pin the threshold with two normalized examples. Track open-ended diversity and constrained-output legality together; do not tune only one switch.

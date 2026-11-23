@@ -458,3 +458,46 @@ If user text closes `<rules>` early, validation fails and you refuse. Version: `
 - How would you watch for a spike in assistant errors after a dependency major ships?
 
 **Reasoning:** The goal is code that matches current dependencies; the constraint is weights frozen at a cutoff. Therefore live artifacts (lockfile, docs, compiler) must override memory, and compile/test failures are the observable correction signal. Prompts only help. Accept on deprecated-API catch rate and tests passing, not on “looks modern.”
+
+## PROMPT-031. A support prompt runs 100 requests a day for the same tenant: 2,000 tokens of stable system rules, 1,500 of tool definitions, 400 of that day’s tenant policy, 3,000 of retrieved chunks that change every turn, and 100 of user question. The server supports prefix caching. Under a schematic tariff, a cache write or a miss is billed at 1× the input price and a hit at 0.1×, with no extra write markup. After which segment should you place the cache breakpoint? How many billing units do the 100 requests cost, and how much do you save versus no cache at all? If you also put the per-turn retrieved chunks into the prefix before the breakpoint, and now assume writes are billed at 1.25×, what happens to the bill?
+
+**Answer:** Place the breakpoint at the end of the prefix that is unchanged for the whole day, not after the retrieved chunks that change every turn. The system rules and tool definitions are stable all day and total 3,500 tokens—that is the first breakpoint. The tenant policy is stable for the day and changes tomorrow, so you may add a second breakpoint at 3,900, but you must not put the 3,000-token retrieved chunks into a cacheable prefix. With the schematic tariff and a single breakpoint at 3,500: the first request writes 3,500 and misses on 3,500, totaling 7,000; each of the next 99 hits 3,500×0.1=350 and misses on 3,500, totaling 3,850; the day sums to 7,000+99×3,850=388,150 billing units. With no cache it is 100×7,000=700,000, so you save 311,850, i.e. 311,850/700,000=0.4455. If the policy is also unchanged all day and the breakpoint moves to 3,900: the first request is still 7,000, each later request is 3,900×0.1+3,100=3,490, the day sums to 7,000+99×3,490=352,510, and you save another 35,640. If the retrieved chunks go before the breakpoint, the prefix changes every turn, all 100 requests miss, and at a 1× write you still pay 700,000, with no savings; if writes are billed at 1.25× and only the last 100-token question is uncached, the bill becomes 100×(6,900×1.25+100)=872,500, which is more expensive than not caching.
+
+**Deep dive:** The prefix-cache key is the exact byte prefix, not “close enough in meaning.” A breakpoint means: this span and everything before it is reusable; everything after it may change. So stable spans must be physically first and volatile spans last: rules → tool definitions → same-day policy → this turn’s retrieval → user question. Writing a per-turn request_id, a clock, or the retrieved chunks at the very front makes the whole prefix different every turn and drives the hit rate to zero—the same family of ordering mistake as “putting a request id at the start of the system prompt and watching the server-side prefix KV go cold,” except this question is about the prompt-side bill, not TTFT. When policy changes once a day, the 3,900 breakpoint must be rewritten on the first request after midnight; do not leave yesterday’s policy in the cache as today’s rule. If tool definitions are hot-updated at noon, you must explicitly invalidate the 3,500 span; do not expect a semantic near-miss to hit. The schematic tariff is only for comparing layouts, not a vendor’s list price. Some implementations also have a minimum cacheable length (for example 1,024 tokens); 3,500 and 3,900 both sit above that line, but do not carve out a 200-token “mini-breakpoint” and expect it to hit. Accept on hit rate and billing units, and also on whether the first request after a policy update is in fact a miss—a high hit rate that still answers with yesterday’s refund window means the cache key did not include the policy version, not that you earned a saving. Do not conflate “turning on prompt caching” with “a semantic cache of the same answer”: the first reuses prefix compute, the second reuses a whole reply, and the keys and invalidation rules are different.
+
+```python
+S, T, U, R, Q = 2000, 1500, 400, 3000, 100
+n = 100
+full = S + T + U + R + Q
+assert full == 7_000
+no_cache = n * full
+assert no_cache == 700_000
+# breakpoint after stable system + tools
+cached, uncached = S + T, U + R + Q
+assert cached == 3_500 and uncached == 3_500
+units_b = 1 * cached + 1 * uncached + 99 * (0.1 * cached + 1 * uncached)
+assert units_b == 388_150
+assert no_cache - units_b == 311_850
+assert (no_cache - units_b) / no_cache == 0.4455
+# second breakpoint after same-day policy
+cached_c, uncached_c = S + T + U, R + Q
+assert cached_c == 3_900 and uncached_c == 3_100
+units_c = 1 * cached_c + 1 * uncached_c + 99 * (0.1 * cached_c + 1 * uncached_c)
+assert units_c == 352_510
+assert units_b - units_c == 35_640
+# wrong: retrieved chunks inside the cached prefix, write = 1.25
+cached_d, uncached_d = S + T + U + R, Q
+assert cached_d == 6_900 and uncached_d == 100
+units_d = n * (1.25 * cached_d + 1 * uncached_d)
+assert units_d == 872_500
+assert units_d > no_cache
+```
+
+**Follow-ups:** If the 100 requests come from 20 tenants with different policies, will the 3,900 breakpoint still hit, and will the 3,500 one? After a noon hot-update of the tool definitions, how do you stop the afternoon from still hitting the morning schema? If you move the user question ahead of the policy just so the product can see the question first, at which step does the cache bill break?
+
+**Extended questions:**
+- Draw the order of the five spans and the two candidate breakpoints, and mark each span’s change period (weekly / daily / per turn).
+- With the schematic tariff, write the four bills: no cache, breakpoint at 3,500, breakpoint at 3,900, and retrieved chunks in the prefix with writes at 1.25×.
+- If the minimum cacheable length is 1,024, tool definitions shrink from 1,500 to 800, and the system rules remain 2,000, can you still place a breakpoint at the end of the rules alone?
+
+**Reasoning:** The goal is to write the all-day-stable prefix once and bill the next 99 requests at the hit price, without locking yesterday’s policy or this turn’s retrieval into the cache. The key is exact bytes, so any change before the breakpoint busts every later hit. Put stable spans first, tier breakpoints by how often a span changes, and leave volatile retrieval and the question after the breakpoint. Accept on billing units and on a miss after a version change, not on whether “caching is on.”
